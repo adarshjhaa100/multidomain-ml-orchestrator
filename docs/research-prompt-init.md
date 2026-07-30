@@ -48,6 +48,8 @@ Here is the fully updated First Principles analysis, rigorously recalculated for
 
 ---
 
+### SOLUTION
+
 ### 1. Research Summary
 
 *   **Hardware Reality (4GB RAM, 4-Core CPU, No OS Overhead):** The full 4.0 GB of RAM is the absolute physical boundary. CPU inference is strictly bound by memory bandwidth, not compute. To achieve 20–30+ tokens/sec, the total memory footprint (Model Weights + KV Cache) must be small enough that the CPU's memory bus can feed it fast enough without hitting the 4.0 GB ceiling.
