@@ -1,0 +1,43 @@
+# =============================================================================
+# requirements.txt — Phase C Dataset Construction Dependencies
+# =============================================================================
+# Install: uv pip install -r requirements.txt
+# Or:      uv sync  (if using pyproject.toml instead)
+#
+# Tiger Style:
+#   - Every dependency listed with its purpose
+#   - Pinned to minimum compatible versions for reproducibility
+#   - No unused imports
+# =============================================================================
+
+# ── tree-sitter and language grammars (AST-based code chunking) ──────────
+tree-sitter>=0.23,<1.0
+tree-sitter-c>=0.23,<1.0
+tree-sitter-python>=0.23,<1.0
+tree-sitter-javascript>=0.23,<1.0
+tree-sitter-css>=0.23,<1.0
+tree-sitter-html>=0.23,<1.0
+
+# ── Local LLM inference for synthetic instruction generation ─────────────
+llama-cpp-python>=0.3,<1.0
+
+# ── Web scraping for documentation layer ─────────────────────────────────
+requests>=2.32,<3.0
+beautifulsoup4>=4.12,<5.0
+
+# ── Repository cloning / git operations ──────────────────────────────────
+gitpython>=3.1,<4.0
+
+# ── Fast JSONL I/O (orjson is 4-10x faster than stdlib json) ─────────────
+orjson>=3.10,<4.0
+
+# ── Hugging Face ecosystem (model download, tokenizer) ───────────────────
+huggingface-hub>=0.24,<1.0
+transformers>=4.44,<5.0
+
+# ── Progress bars and utilities ──────────────────────────────────────────
+tqdm>=4.66,<5.0
+
+# ── Optional: BLAKE3 hashing for faster dedup ────────────────────────────
+# Install only if you want faster deduplication:
+# blake3>=1.0,<2.0

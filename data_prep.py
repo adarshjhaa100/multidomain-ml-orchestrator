@@ -139,6 +139,7 @@ def _load_llm(model_path: str, n_threads: int = 4) -> Any:
 
 
 # =============================================================================
+# %%
 # Phase 0b: Project Paths & Constants
 # =============================================================================
 # Tiger Style: all magic numbers named. No bare literals in logic.
@@ -232,6 +233,7 @@ TS_QUERIES: Dict[str, str] = {
 
 
 # =============================================================================
+# %%
 # Phase 0c: Logging Setup
 # =============================================================================
 # Tiger Style: logging is not hidden. It's explicitly configured with
@@ -258,6 +260,7 @@ def _setup_logging(verbose: bool = False) -> logging.Logger:
 
 
 # =============================================================================
+# %%
 # Phase 0d: Utility Functions
 # =============================================================================
 
@@ -339,7 +342,45 @@ def safe_filename(url_or_name: str) -> str:
     return sanitized[:64]  # Cap length to avoid filesystem issues.
 
 
+def _check_checkpoint(
+    output_path: Path,
+    label: str,
+    min_records: int = 0,
+    logger: Optional[logging.Logger] = None,
+) -> bool:
+    """Check if a phase output already exists and is valid.
+
+    Tiger Style:
+      - Explicit pre/post condition check.
+      - Returns True if checkpoint is valid (skip the phase).
+      - Returns False if checkpoint is missing or invalid (run the phase).
+    """
+    if not output_path.exists():
+        if logger:
+            logger.info("  No prior output at %s — running phase.", output_path)
+        return False
+    file_size = output_path.stat().st_size
+    if file_size == 0:
+        if logger:
+            logger.warning("  Prior output at %s is empty — re-running.", output_path)
+        return False
+    if min_records > 0:
+        line_count = sum(1 for _ in open(output_path, "rb") if _.strip())
+        if line_count < min_records:
+            if logger:
+                logger.warning(
+                    "  Prior output at %s has %d records (need %d) — re-running.",
+                    output_path, line_count, min_records,
+                )
+            return False
+    if logger:
+        size_mb = file_size / (1024 * 1024)
+        logger.info("  Checkpoint found: %s (%.1f MB) — skipping phase.", output_path, size_mb)
+    return True
+
+
 # =============================================================================
+# %%
 # Phase 1: Clone Target Repositories
 # =============================================================================
 
@@ -355,7 +396,12 @@ def phase_clone_repos(logger: logging.Logger) -> List[Path]:
     Returns:
         List of paths to cloned repo directories.
     """
-    logger.info("=== Phase 1: Cloning %d repositories ===", len(REPOS))
+    # Checkpoint: skip if all 8 repos already exist with files.
+    existing = sum(1 for r in REPOS if (REPOS_DIR / r["name"]).exists())
+    if existing == len(REPOS):
+        logger.info("=== Phase 1: All %d repos already cloned — skipping.", len(REPOS))
+        return [REPOS_DIR / r["name"] for r in REPOS]
+    logger.info("=== Phase 1: Cloning %d repositories (%d already exist) ===", len(REPOS), existing)
 
     # Tiger Style: verify tool exists before use.
     git_path = shutil.which("git")
@@ -408,6 +454,7 @@ def phase_clone_repos(logger: logging.Logger) -> List[Path]:
 
 
 # =============================================================================
+# %%
 # Phase 2: Chunk Code with tree-sitter
 # =============================================================================
 
@@ -584,6 +631,9 @@ def phase_chunk_code(logger: logging.Logger) -> Path:
       - Logs per-file progress with tqdm for transparency.
       - Post-condition: code_chunks_raw.jsonl exists and is non-empty.
     """
+    output_path = CHUNKS_DIR / "code_chunks_raw.jsonl"
+    if _check_checkpoint(output_path, "tree-sitter chunks", min_records=50, logger=logger):
+        return output_path
     logger.info("=== Phase 2: tree-sitter chunking ===")
 
     all_chunks: List[Dict[str, Any]] = []
@@ -634,6 +684,7 @@ def phase_chunk_code(logger: logging.Logger) -> Path:
 
 
 # =============================================================================
+# %%
 # Phase 3: Generate Synthetic Instructions
 # =============================================================================
 
@@ -715,6 +766,9 @@ def phase_generate_instructions(logger: logging.Logger) -> Path:
       - Processes chunks in deterministic order with progress bar.
       - Writes filtered results — chunks that failed generation are dropped.
     """
+    output_path = CHUNKS_DIR / "code_chunks_ready.jsonl"
+    if _check_checkpoint(output_path, "generated instructions", min_records=50, logger=logger):
+        return output_path
     logger.info("=== Phase 3: Generating synthetic instructions ===")
 
     input_path = CHUNKS_DIR / "code_chunks_raw.jsonl"
@@ -775,6 +829,7 @@ def phase_generate_instructions(logger: logging.Logger) -> Path:
 
 
 # =============================================================================
+# %%
 # Phase 4: Scrape Documentation
 # =============================================================================
 
@@ -949,6 +1004,9 @@ def phase_scrape_docs(logger: logging.Logger) -> Path:
       - Processes each doc source independently (one fails, others continue).
       - Post-condition: doc_chunks.jsonl has at least 100 examples.
     """
+    output_path = CHUNKS_DIR / "doc_chunks.jsonl"
+    if _check_checkpoint(output_path, "doc Q&A pairs", min_records=50, logger=logger):
+        return output_path
     logger.info("=== Phase 4: Scraping documentation ===")
 
     cache_dir = DOCS_DIR / "raw_cache"
@@ -1026,6 +1084,7 @@ def phase_scrape_docs(logger: logging.Logger) -> Path:
 
 
 # =============================================================================
+# %%
 # Phase 5: Build Alignment Examples
 # =============================================================================
 
@@ -1240,6 +1299,9 @@ def phase_build_alignment(logger: logging.Logger) -> Path:
       - LLM expansion is optional — core seeds are always present.
       - Post-condition: alignment_chunks.jsonl has at least 50 examples.
     """
+    output_path = CHUNKS_DIR / "alignment_chunks.jsonl"
+    if _check_checkpoint(output_path, "alignment examples", min_records=5, logger=logger):
+        return output_path
     logger.info("=== Phase 5: Building alignment examples ===")
 
     model_path = MODELS_DIR / "qwen2.5-coder-1.5b-instruct-q4_k_m.gguf"
@@ -1344,6 +1406,7 @@ def phase_build_alignment(logger: logging.Logger) -> Path:
 
 
 # =============================================================================
+# %%
 # Phase 6: Token Accounting & Quality Filtering
 # =============================================================================
 
@@ -1374,6 +1437,19 @@ def phase_filter_and_balance(logger: logging.Logger) -> Dict[str, Path]:
     Returns:
         Dict mapping layer name → filtered file path.
     """
+    # Check if all three filtered files already exist.
+    all_exist = all(
+        (CHUNKS_DIR / f"{layer}_chunks_filtered.jsonl").exists()
+        for layer in ["code", "doc", "alignment"]
+    )
+    if all_exist:
+        sizes = {
+            layer: (CHUNKS_DIR / f"{layer}_chunks_filtered.jsonl").stat().st_size
+            for layer in ["code", "doc", "alignment"]
+        }
+        total_mb = sum(sizes.values()) / (1024 * 1024)
+        logger.info("=== Phase 6: All 3 filtered files exist (%.1f MB total) — skipping.", total_mb)
+        return {layer: CHUNKS_DIR / f"{layer}_chunks_filtered.jsonl" for layer in ["code", "doc", "alignment"]}
     logger.info("=== Phase 6: Token accounting & filtering ===")
 
     layer_files = {
@@ -1491,6 +1567,7 @@ def phase_filter_and_balance(logger: logging.Logger) -> Dict[str, Path]:
 
 
 # =============================================================================
+# %%
 # Phase 7: Mix, Shuffle & Write Final Dataset
 # =============================================================================
 
@@ -1504,6 +1581,9 @@ def phase_mix_and_shuffle(
       - Explicit post-condition: train.jsonl contains exactly the sum of all layer counts.
       - Writes stats.json alongside train.jsonl for auditability.
     """
+    output_path = DATA_DIR / "train.jsonl"
+    if _check_checkpoint(output_path, "final dataset", min_records=100, logger=logger):
+        return output_path
     logger.info("=== Phase 7: Mixing, shuffling & writing final dataset ===")
 
     all_examples: List[Dict[str, Any]] = []
@@ -1560,6 +1640,7 @@ def phase_mix_and_shuffle(
 
 
 # =============================================================================
+# %%
 # Phase 8: Validate Final Dataset
 # =============================================================================
 
@@ -1698,6 +1779,7 @@ def phase_validate(logger: logging.Logger) -> bool:
     return all_pass
 
 
+# %%
 # =============================================================================
 # CLI Entry Point
 # =============================================================================
