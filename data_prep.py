@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
 data_prep.py — Phase C: Dataset Construction (The 60/25/15 Rule)
 ================================================================
@@ -47,6 +46,7 @@ import subprocess
 import sys
 import textwrap
 import time
+import uuid
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -103,11 +103,12 @@ except ImportError:
 _llm_instance: Any = None
 
 
-def _load_llm(model_path: str, n_threads: int = 4) -> Any:
+def _load_llm(model_path: str, n_threads: Optional[int] = None) -> Any:
     """Lazy-load the GGUF model via llama-cpp-python.
 
     Tiger Style: explicit resource acquisition — caller decides when to load.
     No hidden initialization at module level.
+    Offloads all layers to GPU when available.
     """
     global _llm_instance
     if _llm_instance is not None:
@@ -129,10 +130,13 @@ def _load_llm(model_path: str, n_threads: int = 4) -> Any:
         f"Model file suspiciously small ({model_path_resolved.stat().st_size} bytes). "
         "Download may be corrupted."
     )
+    if n_threads is None:
+        n_threads = os.cpu_count() or 4
     _llm_instance = Llama(
         model_path=str(model_path_resolved),
         n_ctx=2048,       # Tiger Style: explicit context cap — no unbounded memory
         n_threads=n_threads,
+        n_gpu_layers=-1,  # Offload all layers to GPU
         verbose=False,
     )
     return _llm_instance
@@ -151,6 +155,7 @@ DOCS_DIR = INPUT_DATA_DIR / "docs"
 ALIGNMENT_DIR = INPUT_DATA_DIR / "alignment"
 DATA_DIR = PROJECT_ROOT / "data"
 CHUNKS_DIR = DATA_DIR / "chunks"
+LOGS_DIR = DATA_DIR / "logs"
 MODELS_DIR = PROJECT_ROOT / "models"
 
 # Tiger Style: explicit bounds on every data dimension.
@@ -221,8 +226,10 @@ TS_QUERIES: Dict[str, str] = {
     """,
     "html": """
         (element
-          (tag_name) @tag
-          (#match? @tag "^(main|section|article|form|template|nav|header|footer)$")
+          (start_tag
+            (tag_name) @tag
+            (#match? @tag "^(main|section|article|form|template|nav|header|footer)$")
+          )
         ) @semantic
     """,
     "css": """
@@ -242,19 +249,37 @@ TS_QUERIES: Dict[str, str] = {
 def _setup_logging(verbose: bool = False) -> logging.Logger:
     """Configure a root logger with explicit format and level.
 
-    Post-condition: logger is ready, handlers are attached.
+    Tiger Style:
+      - Logs go to stdout AND an append-only file per run.
+      - File name: <run_id>_<ts_in_ns>.log under data/logs/.
+      - Post-condition: logger is ready, handlers are attached.
     """
     logger = logging.getLogger("data_prep")
     logger.setLevel(logging.DEBUG if verbose else logging.INFO)
 
-    handler = logging.StreamHandler(sys.stdout)
-    handler.setFormatter(logging.Formatter(
+    formatter = logging.Formatter(
         "[%(asctime)s] %(levelname)-8s %(message)s",
         datefmt="%H:%M:%S",
-    ))
-    # Tiger Style: no duplicate handlers on re-initialization.
-    if not logger.handlers:
-        logger.addHandler(handler)
+    )
+
+    # Tiger Style: explicit handler set — no duplicate handlers on re-init.
+    if logger.handlers:
+        return logger
+
+    stream_handler = logging.StreamHandler(sys.stdout)
+    stream_handler.setFormatter(formatter)
+    logger.addHandler(stream_handler)
+
+    # Append-only per-run file: data/logs/<run_id>_<ts_in_ns>.log.
+    ensure_dir(LOGS_DIR)
+    run_id = uuid.uuid4().hex[:8]
+    ts_ns = time.time_ns()
+    log_path = LOGS_DIR / f"{run_id}_{ts_ns}.log"
+    file_handler = logging.FileHandler(log_path, mode="a", encoding="utf-8")
+    file_handler.setFormatter(formatter)
+    logger.addHandler(file_handler)
+
+    logger.info("Log file: %s", log_path)
 
     return logger
 
@@ -300,21 +325,23 @@ def read_jsonl(path: Path) -> List[Dict[str, Any]]:
     return results
 
 
-def write_jsonl(path: Path, records: List[Dict[str, Any]]) -> Path:
+def write_jsonl(path: Path, records: List[Dict[str, Any]], mode: str = "w") -> Path:
     """Write records to a JSONL file using orjson for speed.
 
     Tiger Style: post-condition asserts file written with correct record count.
+    Use mode='a' to append to an existing file.
     """
     ensure_dir(path.parent)
     # Tiger Style: use binary mode, explicit encoding — no hidden text transforms.
-    with open(path, "wb") as f:
+    with open(path, "ab" if mode == "a" else "wb") as f:
         for record in records:
             f.write(orjson.dumps(record, option=orjson.OPT_APPEND_NEWLINE))
-    # Post-condition validation.
-    written_count = sum(1 for _ in open(path, "rb") if _.strip())
-    assert written_count == len(records), (
-        f"Write count mismatch: expected {len(records)}, got {written_count}"
-    )
+    if mode != "a":
+        # Post-condition validation only for fresh writes (append count depends on prior state).
+        written_count = sum(1 for _ in open(path, "rb") if _.strip())
+        assert written_count == len(records), (
+            f"Write count mismatch: expected {len(records)}, got {written_count}"
+        )
     return path
 
 
@@ -336,10 +363,15 @@ def safe_filename(url_or_name: str) -> str:
     """Sanitize a string for use as a filename.
 
     Tiger Style: explicit character filtering — no assumptions about input.
+    Appends a short hash when the sanitized name is truncated so that long
+    URLs never collide to the same cache file.
     """
     sanitized = re.sub(r"[^a-zA-Z0-9_-]", "_", url_or_name)
     assert len(sanitized) > 0, f"Filename became empty after sanitization: {url_or_name}"
-    return sanitized[:64]  # Cap length to avoid filesystem issues.
+    if len(sanitized) <= 64:
+        return sanitized
+    digest = hashlib.sha1(url_or_name.encode("utf-8")).hexdigest()[:8]
+    return f"{sanitized[:55]}_{digest}"
 
 
 def _check_checkpoint(
@@ -466,11 +498,11 @@ def _init_tree_sitter_parser(language_name: str) -> Parser:
     """
     # Map language name → pip package name → tree-sitter language object.
     grammar_map = {
-        "c":          ("tree_sitter_c",          "language_c"),
-        "python":     ("tree_sitter_python",     "language_python"),
-        "javascript": ("tree_sitter_javascript", "language_javascript"),
-        "html":       ("tree_sitter_html",       "language_html"),
-        "css":        ("tree_sitter_css",        "language_css"),
+        "c":          "tree_sitter_c",
+        "python":     "tree_sitter_python",
+        "javascript": "tree_sitter_javascript",
+        "html":       "tree_sitter_html",
+        "css":        "tree_sitter_css",
     }
 
     assert language_name in grammar_map, (
@@ -478,18 +510,18 @@ def _init_tree_sitter_parser(language_name: str) -> Parser:
         f"Supported: {list(grammar_map.keys())}"
     )
 
-    module_name, attr_name = grammar_map[language_name]
+    module_name = grammar_map[language_name]
     try:
-        lang_mod = __import__(module_name, fromlist=[attr_name])
+        lang_mod = __import__(module_name)
     except ImportError:
         raise ImportError(
             f"Missing tree-sitter grammar for {language_name}. "
             f"Install: uv pip install tree-sitter-{language_name}"
         )
 
-    lang_obj = getattr(lang_mod, attr_name)
+    lang_obj = Language(lang_mod.language())
     parser = Parser()
-    parser.set_language(lang_obj)
+    parser.language = lang_obj
     return parser
 
 
@@ -567,9 +599,10 @@ def _extract_chunks_tree_sitter(
     assert query is not None, f"No tree-sitter query defined for {language}"
 
     try:
-        from tree_sitter import Query
-        ts_query = Query(language, query)
-        captures = ts_query.matches(root_node)
+        from tree_sitter import Query, QueryCursor
+        ts_query = Query(parser.language, query)
+        cursor = QueryCursor(ts_query)
+        captures = cursor.matches(root_node)
     except Exception as exc:
         logger.warning("  tree-sitter query failed for %s: %s", filepath.name, exc)
         return []
@@ -613,7 +646,8 @@ def _extract_chunks_tree_sitter(
                     "file_path": str(filepath.relative_to(filepath.parent.parent.parent)),
                     "chunk_type": capture_name,
                     "name": first_line.split("(")[0].split()[-1]
-                    if "(" in first_line else first_line[:64],
+                    if "(" in first_line and first_line.split("(")[0].strip()
+                    else first_line[:64],
                     "start_line": start_line,
                     "end_line": end_line,
                     "code": chunk_text,
@@ -786,12 +820,25 @@ def phase_generate_instructions(logger: logging.Logger) -> Path:
         "qwen2.5-coder-1.5b-instruct-q4_k_m.gguf --local-dir models/"
     )
 
-    llm = _load_llm(str(model_path))
+    model_path_str = str(model_path)
+    _llm_instance = None  # Fresh load with GPU
+    llm = _load_llm(model_path_str)
 
-    results: List[Dict[str, Any]] = []
+    completed = 0
+    if output_path.exists():
+        completed = sum(1 for _ in open(output_path, "rb") if _.strip())
+        logger.info("  Resuming from checkpoint: %d chunks already done", completed)
+
     generation_failures = 0
+    saved_count = 0
 
-    for chunk in tqdm(chunks, desc="  Generating instructions"):
+    ensure_dir(output_path.parent)
+    fout = open(output_path, "ab")
+
+    for idx, chunk in enumerate(tqdm(chunks, desc="  Generating instructions")):
+        if idx < completed:
+            continue
+
         instruction = _generate_instruction(
             llm, chunk["language"], chunk["code"], logger
         )
@@ -799,7 +846,7 @@ def phase_generate_instructions(logger: logging.Logger) -> Path:
             generation_failures += 1
             continue
 
-        results.append({
+        record = {
             "instruction": instruction,
             "input": "",
             "output": chunk["code"],
@@ -809,22 +856,26 @@ def phase_generate_instructions(logger: logging.Logger) -> Path:
                 "repo": chunk["repo"],
                 "chunk_name": chunk.get("name", "unknown"),
             },
-        })
+        }
+        fout.write(orjson.dumps(record, option=orjson.OPT_APPEND_NEWLINE))
+        fout.flush()
+        saved_count += 1
 
+    fout.close()
+
+    total_done = completed + saved_count
     logger.info(
         "  Generated: %d / %d chunks (%.1f%% success, %d failures)",
-        len(results), len(chunks),
-        len(results) / max(len(chunks), 1) * 100,
+        total_done, len(chunks),
+        total_done / max(len(chunks), 1) * 100,
         generation_failures,
     )
 
-    assert len(results) > 50, (
-        f"Only {len(results)} successful generations. Check model or chunks."
+    assert total_done > 50, (
+        f"Only {total_done} successful generations. Check model or chunks."
     )
 
-    output_path = CHUNKS_DIR / "code_chunks_ready.jsonl"
-    write_jsonl(output_path, results)
-    logger.info("  Written: %s (%d examples)", output_path, len(results))
+    logger.info("  Written: %s (%d examples)", output_path, total_done)
     return output_path
 
 
@@ -837,8 +888,8 @@ DOC_SOURCES = {
     "cppreference": {
         "base_url": "https://en.cppreference.com/w/c",
         "sections": [
-            "string", "stdio", "stdlib", "math", "time",
-            "memory", "thread", "atomic", "locale", "signal",
+            "string", "io", "program", "numeric", "chrono",
+            "memory", "thread", "atomic", "locale", "program/signal",
         ],
     },
     "python_docs": {
@@ -963,24 +1014,26 @@ def _parse_cppreference_page(html: str, url: str) -> Optional[Dict[str, Any]]:
 def _parse_python_doc_page(html: str, module_name: str) -> List[Dict[str, Any]]:
     """Parse a Python docs page into one or more Q&A examples.
 
-    Tiger Style: iterates over all <dt> elements (function signatures)
-    and produces one example per function.
+    Tiger Style: iterates over all <dt class="sig"> elements (function
+    signatures) and produces one example per function.
     """
     soup = BeautifulSoup(html, "html.parser")
     results: List[Dict[str, Any]] = []
 
-    # Find function definitions (Python docs use <dt> for signatures).
-    for dt in soup.find_all("dt"):
-        code_elem = dt.find("code")
-        if not code_elem:
+    # Modern Python docs mark signatures with <dt class="sig sig-object py">.
+    for dt in soup.find_all("dt", class_=True):
+        classes = dt.get("class") or []
+        if "sig" not in classes:
             continue
-        signature = code_elem.get_text(strip=True)
+        signature = " ".join(dt.get_text(" ", strip=True).split())
+        # Strip the trailing "¶" anchor link if present.
+        signature = re.sub(r"\s*¶\s*$", "", signature)
         if not signature or "(" not in signature:
             continue
 
         # Get the description from the following <dd>.
         dd = dt.find_next("dd")
-        description = dd.get_text(strip=True)[:1000] if dd else ""
+        description = dd.get_text(" ", strip=True)[:1000] if dd else ""
 
         func_name = signature.split("(")[0].strip().split(".")[-1]
         instruction = f"What is the Python {module_name}.{func_name} function signature and behavior?"
@@ -1115,6 +1168,28 @@ TIGER_PRINCIPLES: List[Dict[str, str]] = [
     },
 ]
 
+PRINCIPLE_HINTS: Dict[str, str] = {
+    "No hidden memory allocations": (
+        "it allocates memory or resources internally and returns them, "
+        "hiding ownership from the caller"
+    ),
+    "No implicit control flow": (
+        "it raises exceptions or panics instead of returning explicit error codes"
+    ),
+    "Explicit bounds checking": (
+        "it accesses arrays, lists, or buffers without verifying the index is in range"
+    ),
+    "No undefined behavior": (
+        "it relies on undefined behavior like signed overflow or uninitialized reads"
+    ),
+    "Deterministic destruction": (
+        "it leaks resources on early returns instead of cleaning up in reverse order"
+    ),
+    "Minimal dependencies": (
+        "it pulls in heavy external dependencies when the standard library suffices"
+    ),
+}
+
 # Tiger Style: seed examples hand-crafted with care. Each demonstrates
 # one principle violation and its correct fix.
 SEED_EXAMPLES: List[Dict[str, str]] = [
@@ -1186,6 +1261,156 @@ SEED_EXAMPLES: List[Dict[str, str]] = [
             "        return json.loads(resp.read().decode())"
         ),
     },
+    {
+        "principle": "No implicit control flow",
+        "language": "c",
+        "bad": (
+            "int div(int a, int b) {\n"
+            "    return a / b;  // Throws SIGFPE on b == 0\n"
+            "}"
+        ),
+        "good": (
+            "int div(int a, int b, int* out) {\n"
+            "    if (out == NULL || b == 0) return -1;  // Explicit error code\n"
+            "    *out = a / b;\n"
+            "    return 0;\n"
+            "}"
+        ),
+    },
+    {
+        "principle": "No undefined behavior",
+        "language": "c",
+        "bad": (
+            "int add(int a, int b) {\n"
+            "    return a + b;  // Signed overflow is UB\n"
+            "}"
+        ),
+        "good": (
+            "#include <stdint.h>\n\n"
+            "int add_safe(int a, int b, int* out) {\n"
+            "    if (out == NULL) return -1;\n"
+            "    if ((b > 0 && a > INT32_MAX - b) ||\n"
+            "        (b < 0 && a < INT32_MIN - b)) return -2;  // Overflow check\n"
+            "    *out = a + b;\n"
+            "    return 0;\n"
+            "}"
+        ),
+    },
+    {
+        "principle": "Deterministic destruction",
+        "language": "c",
+        "bad": (
+            "void process_file(const char* path) {\n"
+            "    FILE* f = fopen(path, \"r\");\n"
+            "    char buf[256];\n"
+            "    while (fgets(buf, sizeof(buf), f)) {\n"
+            "        if (strstr(buf, \"error\")) return;  // Leaks FILE!\n"
+            "        handle(buf);\n"
+            "    }\n"
+            "    fclose(f);\n"
+            "}"
+        ),
+        "good": (
+            "void process_file(const char* path) {\n"
+            "    FILE* f = fopen(path, \"r\");\n"
+            "    if (!f) return;\n"
+            "    char buf[256];\n"
+            "    while (fgets(buf, sizeof(buf), f)) {\n"
+            "        if (strstr(buf, \"error\")) {\n"
+            "            fclose(f);\n"
+            "            return;\n"
+            "        }\n"
+            "        handle(buf);\n"
+            "    }\n"
+            "    fclose(f);\n"
+            "}"
+        ),
+    },
+    {
+        "principle": "Explicit bounds checking",
+        "language": "javascript",
+        "bad": (
+            "function getItem(items, index) {\n"
+            "    return items[index];  // undefined on out-of-range\n"
+            "}"
+        ),
+        "good": (
+            "function getItem(items, index) {\n"
+            "    if (index < 0 || index >= items.length) {\n"
+            "        return null;  // Explicit bounds check\n"
+            "    }\n"
+            "    return items[index];\n"
+            "}"
+        ),
+    },
+    {
+        "principle": "No hidden memory allocations",
+        "language": "python",
+        "bad": (
+            "def read_file(path):\n"
+            "    with open(path) as f:\n"
+            "        return f.read()  # Returns unbounded string\n"
+        ),
+        "good": (
+            "def read_file(path, max_bytes):\n"
+            "    with open(path) as f:\n"
+            "        data = f.read(max_bytes + 1)  # Caller-controlled bound\n"
+            "    if len(data) > max_bytes:\n"
+            "        raise ValueError('file too large')\n"
+            "    return data"
+        ),
+    },
+    {
+        "principle": "Deterministic destruction",
+        "language": "python",
+        "bad": (
+            "def get_conn():\n"
+            "    import sqlite3\n"
+            "    return sqlite3.connect('app.db')  # Caller must remember to close\n"
+        ),
+        "good": (
+            "from contextlib import contextmanager\n"
+            "import sqlite3\n\n"
+            "@contextmanager\n"
+            "def get_conn(db_path='app.db'):\n"
+            "    conn = sqlite3.connect(db_path)\n"
+            "    try:\n"
+            "        yield conn\n"
+            "    finally:\n"
+            "        conn.close()  # Deterministic destruction in reverse order"
+        ),
+    },
+    {
+        "principle": "No implicit control flow",
+        "language": "python",
+        "bad": (
+            "def config_value(name):\n"
+            "    return CONFIG[name]  # Raises KeyError\n"
+        ),
+        "good": (
+            "from typing import Optional\n\n"
+            "def config_value(name) -> Optional[str]:\n"
+            "    if name not in CONFIG:\n"
+            "        return None  # Explicit error return\n"
+            "    return CONFIG[name]"
+        ),
+    },
+    {
+        "principle": "No undefined behavior",
+        "language": "python",
+        "bad": (
+            "def pop_tail(items):\n"
+            "    return items.pop()  # IndexError on empty list\n"
+        ),
+        "good": (
+            "from typing import List, Optional, TypeVar\n\n"
+            "T = TypeVar('T')\n\n"
+            "def pop_tail(items: List[T]) -> Optional[T]:\n"
+            "    if not items:\n"
+            "        return None  # Defined behavior on empty input\n"
+            "    return items.pop()"
+        ),
+    },
 ]
 
 
@@ -1231,62 +1456,136 @@ def _build_alignment_from_seed(
     }
 
 
+def _generate_bad_code(
+    llm: Any,
+    language: str,
+    principle: str,
+) -> Optional[str]:
+    """Generate a code snippet that violates a Tiger Style principle.
+
+    Tiger Style: continuation-style prompt (the model completes after the
+    "Output only the code:" lead-in) — the instruction-tuned model reliably
+    produces code this way instead of parroting the format spec.
+    """
+    hint = PRINCIPLE_HINTS.get(principle, "it violates Tiger Style principles")
+    prompt = (
+        f"Write a short {language} function that has this flaw: {hint}. "
+        f"Keep it under 15 lines. Output only the code:\n"
+    )
+    try:
+        response = llm(prompt, max_tokens=256, temperature=0.8, stop=["\n\n"])
+        return _strip_code_fences(response["choices"][0]["text"].strip())
+    except Exception:
+        return None
+
+
+def _generate_good_code(
+    llm: Any,
+    language: str,
+    principle: str,
+    bad_code: str,
+) -> Optional[str]:
+    """Generate the corrected version of a flawed code snippet.
+
+    Tiger Style: continuation-style prompt that fixes the given bad code.
+    """
+    prompt = (
+        f"Here is a {language} function that violates '{principle}':\n"
+        f"{bad_code}\n\n"
+        f"Here is the corrected version that complies with '{principle}':\n"
+    )
+    try:
+        response = llm(prompt, max_tokens=256, temperature=0.7, stop=["\n\n"])
+        return _strip_code_fences(response["choices"][0]["text"].strip())
+    except Exception:
+        return None
+
+
+def _strip_code_fences(code: str) -> str:
+    """Remove leading/trailing ``` fences an LLM may wrap code in.
+
+    Tiger Style: defensive — strips only complete fence pairs, never content.
+    """
+    lines = code.strip().splitlines()
+    if lines and lines[0].strip().startswith("```"):
+        lines = lines[1:]
+    if lines and lines[-1].strip().startswith("```"):
+        lines = lines[:-1]
+    return "\n".join(lines).strip()
+
+
 def _expand_alignment_examples(
     seed_examples: List[Dict[str, Any]],
     llm: Any,
     logger: logging.Logger,
     target_count: int = 200,
 ) -> List[Dict[str, Any]]:
-    """Expand seed examples by generating language variants.
+    """Expand seed examples to a target count.
 
-    Takes each seed and asks the LLM to translate it to other languages
-    (C → Python → JS → HTML) with appropriate adaptations.
+    Tiger Style:
+      - Starts from deterministic hand-crafted seeds (never empty).
+      - For each (principle, language) pair, generates a fresh flawed snippet
+        then its corrected fix, looping until target_count is reached.
+      - Every generated example is length-validated and deduplicated by
+        output hash; failures are logged, never silently accepted.
     """
     expanded: List[Dict[str, Any]] = list(seed_examples)
-    target_languages = ["c", "python", "javascript", "html"]
+    seen_outputs: set = set(compute_blake3(ex["output"]) for ex in expanded)
+    target_languages = ["c", "python", "javascript", "html", "css"]
+    principles = list(PRINCIPLE_HINTS.keys())
+    round_num = 0
+    max_rounds = 60
 
-    for seed in seed_examples:
-        source_lang = seed.get("metadata", {}).get("language", "c")
-        for target_lang in target_languages:
-            if target_lang == source_lang:
-                continue
+    while len(expanded) < target_count and round_num < max_rounds:
+        round_num += 1
+        made_progress = False
 
-            prompt = (
-                f"Translate this Tiger Style refactoring from {source_lang} "
-                f"to {target_lang}. Keep the same principle: "
-                f"{seed.get('metadata', {}).get('principle', 'unknown')}.\n\n"
-                f"ORIGINAL BAD CODE ({source_lang}):\n```\n{seed['input']}\n```\n\n"
-                f"ORIGINAL GOOD CODE ({source_lang}):\n```\n{seed['output'].split('</thought>')[-1].strip()}\n```\n\n"
-                f"Output ONLY the {target_lang} version of the good code."
-            )
+        for principle in principles:
+            if len(expanded) >= target_count:
+                break
+            for target_lang in target_languages:
+                if len(expanded) >= target_count:
+                    break
 
-            try:
-                response = llm(prompt, max_tokens=256, temperature=0.6, stop=["\n\n\n"])
-                translated_code = response["choices"][0]["text"].strip()
-            except Exception:
-                continue
+                bad_code = _generate_bad_code(llm, target_lang, principle)
+                if not bad_code or len(bad_code) < 10:
+                    logger.debug("  Bad-code generation too short for %s/%s",
+                                 principle, target_lang)
+                    continue
 
-            if len(translated_code) < 20:
-                continue
+                good_code = _generate_good_code(llm, target_lang, principle, bad_code)
+                if not good_code or len(good_code) < 10:
+                    logger.debug("  Good-code generation failed for %s/%s",
+                                 principle, target_lang)
+                    continue
 
-            expanded.append({
-                "instruction": (
-                    f"Refactor this {target_lang} code to comply with Tiger Style: "
-                    f"{seed.get('metadata', {}).get('principle', 'unknown')}"
-                ),
-                "input": f"// Translated from {source_lang}: needs Tiger Style fix",
-                "output": (
-                    f"<thought>Applying {seed.get('metadata', {}).get('principle', 'unknown')} "
-                    f"in {target_lang}.</thought>\n\n{translated_code}"
-                ),
-                "metadata": {
-                    "layer": "alignment",
-                    "principle": seed.get("metadata", {}).get("principle", "unknown"),
-                    "language": target_lang,
-                },
-            })
+                output = f"<thought>Fixing '{principle}' in {target_lang}.</thought>\n\n{good_code}"
+                output_hash = compute_blake3(output)
+                if output_hash in seen_outputs:
+                    logger.debug("  Duplicate alignment example skipped")
+                    continue
+                seen_outputs.add(output_hash)
 
-    # Cap to target count.
+                expanded.append({
+                    "instruction": (
+                        f"Refactor this {target_lang} code to comply with Tiger Style: "
+                        f"{principle}"
+                    ),
+                    "input": bad_code,
+                    "output": output,
+                    "metadata": {
+                        "layer": "alignment",
+                        "principle": principle,
+                        "language": target_lang,
+                    },
+                })
+                made_progress = True
+
+        if not made_progress:
+            logger.warning("  No new alignment examples generated in round %d — stopping.", round_num)
+            break
+
+    logger.info("  Alignment expansion: %d examples after %d rounds", len(expanded), round_num)
     random.shuffle(expanded)
     return expanded[:target_count]
 
@@ -1300,7 +1599,7 @@ def phase_build_alignment(logger: logging.Logger) -> Path:
       - Post-condition: alignment_chunks.jsonl has at least 50 examples.
     """
     output_path = CHUNKS_DIR / "alignment_chunks.jsonl"
-    if _check_checkpoint(output_path, "alignment examples", min_records=5, logger=logger):
+    if _check_checkpoint(output_path, "alignment examples", min_records=100, logger=logger):
         return output_path
     logger.info("=== Phase 5: Building alignment examples ===")
 
@@ -1340,7 +1639,7 @@ def phase_build_alignment(logger: logging.Logger) -> Path:
 
     # Expand to more examples via LLM (if available).
     if llm:
-        expanded = _expand_alignment_examples(seed_results, llm, logger, target_count=1500)
+        expanded = _expand_alignment_examples(seed_results, llm, logger, target_count=500)
         logger.info("  Expanded to %d examples via LLM", len(expanded))
         all_alignment = expanded
     else:
@@ -1394,7 +1693,7 @@ def phase_build_alignment(logger: logging.Logger) -> Path:
 
     logger.info("  Total alignment examples: %d", len(all_alignment))
 
-    assert len(all_alignment) >= 5, (
+    assert len(all_alignment) >= 50, (
         f"Only {len(all_alignment)} alignment examples. "
         "Check seed examples and LLM availability."
     )
@@ -1410,19 +1709,59 @@ def phase_build_alignment(logger: logging.Logger) -> Path:
 # Phase 6: Token Accounting & Quality Filtering
 # =============================================================================
 
+_tokenizer: Any = None
+
+
 def _count_tokens(text: str) -> int:
     """Count tokens using SmolLM3's tokenizer.
 
-    Falls back to a simple whitespace split if tokenizer is unavailable
-    (Tiger Style: degrade gracefully, never crash).
+    Tiger Style:
+      - The tokenizer is loaded ONCE and cached — re-instantiating it per
+        example would take ~1.7s × N examples (hours for 58k chunks).
+      - Falls back to a simple whitespace split if tokenizer is unavailable
+        (degrade gracefully, never crash).
     """
+    global _tokenizer
     try:
-        from transformers import AutoTokenizer
-        tokenizer = AutoTokenizer.from_pretrained("HuggingFaceTB/SmolLM3-3B")
-        return len(tokenizer.encode(text))
+        if _tokenizer is None:
+            from transformers import AutoTokenizer
+            _tokenizer = AutoTokenizer.from_pretrained("HuggingFaceTB/SmolLM3-3B")
+        return len(_tokenizer.encode(text))
     except Exception:
         # Fallback: rough estimate (~4 chars per token for code).
         return max(1, len(text) // 4)
+
+
+def _sample_layer_to_tokens(
+    examples: List[Dict[str, Any]],
+    target_tokens: int,
+) -> List[Dict[str, Any]]:
+    """Deterministically subsample a layer down to a token budget.
+
+    Tiger Style:
+      - Seeded shuffle so runs are reproducible.
+      - Greedy selection fills the budget without exceeding it by more
+        than one example.
+      - Returns the full list if already within budget (never grows).
+    """
+    if sum(ex.get("token_count", 0) for ex in examples) <= target_tokens:
+        return examples
+
+    sampled: List[Dict[str, Any]] = []
+    budget_left = target_tokens
+    # Tiger Style: deterministic — same input, same sample every run.
+    shuffled = list(examples)
+    random.seed(42)
+    random.shuffle(shuffled)
+
+    for ex in shuffled:
+        tokens = ex.get("token_count", 0)
+        if budget_left - tokens < 0:
+            continue
+        sampled.append(ex)
+        budget_left -= tokens
+
+    return sampled
 
 
 def phase_filter_and_balance(logger: logging.Logger) -> Dict[str, Path]:
@@ -1431,7 +1770,7 @@ def phase_filter_and_balance(logger: logging.Logger) -> Dict[str, Path]:
     Tiger Style:
       - Every example is validated against MIN/MAX token bounds.
       - Exact deduplication by output hash.
-      - Ratio balancing with explicit tolerance check.
+      - Proportional subsampling brings layers to the 60/25/15 token ratio.
       - Post-condition: each layer file has < 2048 tokens per example.
 
     Returns:
@@ -1459,8 +1798,7 @@ def phase_filter_and_balance(logger: logging.Logger) -> Dict[str, Path]:
     }
 
     filtered_paths: Dict[str, Path] = {}
-    total_tokens_by_layer: Dict[str, int] = {}
-    total_examples_by_layer: Dict[str, int] = {}
+    filtered_by_layer: Dict[str, List[Dict[str, Any]]] = {}
 
     for layer_name, input_path in layer_files.items():
         if not input_path.exists():
@@ -1475,7 +1813,7 @@ def phase_filter_and_balance(logger: logging.Logger) -> Dict[str, Path]:
         seen_hashes: set = set()
         dropped_reasons: Dict[str, int] = {}
 
-        for ex in examples:
+        for ex in tqdm(examples, desc=f"    Filtering {layer_name}", leave=False):
             # Tiger Style: validate required keys exist.
             assert "instruction" in ex, f"Missing 'instruction' key in {ex}"
             assert "output" in ex, f"Missing 'output' key in {ex}"
@@ -1522,21 +1860,59 @@ def phase_filter_and_balance(logger: logging.Logger) -> Dict[str, Path]:
                 dict(sorted(dropped_reasons.items(), key=lambda x: -x[1])),
             )
 
-        # ── Write filtered output ──────────────────────────────────────────
-        output_path = CHUNKS_DIR / f"{layer_name}_chunks_filtered.jsonl"
-        write_jsonl(output_path, filtered)
-        filtered_paths[layer_name] = output_path
-
         layer_tokens = sum(ex.get("token_count", 0) for ex in filtered)
-        total_tokens_by_layer[layer_name] = layer_tokens
-        total_examples_by_layer[layer_name] = len(filtered)
-
         logger.info(
-            "    → %d examples, %d tokens preserved",
+            "    → %d examples, %d tokens after filtering",
             len(filtered), layer_tokens,
         )
+        filtered_by_layer[layer_name] = filtered
 
-    # ── Ratio balancing ────────────────────────────────────────────────────
+    # ── Ratio balancing (Tiger Style: proportional subsampling) ────────────
+    ratios = {
+        "code": TARGET_CODE_PCT,
+        "doc": TARGET_DOC_PCT,
+        "alignment": TARGET_ALIGN_PCT,
+    }
+    available_tokens = {
+        layer: sum(ex.get("token_count", 0) for ex in examples)
+        for layer, examples in filtered_by_layer.items()
+    }
+
+    # The binding layer is the one that fills its target ratio with the
+    # fewest tokens — it caps the whole dataset size.
+    max_total = min(
+        available_tokens.get(layer, 0) / ratio
+        for layer, ratio in ratios.items()
+        if layer in filtered_by_layer
+    )
+    logger.info(
+        "  Balancing 3 layers to %d/%d/%d (binding total ≈ %.0f tokens)",
+        int(TARGET_CODE_PCT * 100), int(TARGET_DOC_PCT * 100),
+        int(TARGET_ALIGN_PCT * 100), max_total,
+    )
+
+    balanced_by_layer: Dict[str, List[Dict[str, Any]]] = {}
+    total_tokens_by_layer: Dict[str, int] = {}
+    total_examples_by_layer: Dict[str, int] = {}
+
+    for layer_name, examples in filtered_by_layer.items():
+        target_tokens = int(max_total * ratios[layer_name])
+        balanced = _sample_layer_to_tokens(examples, target_tokens)
+        balanced_by_layer[layer_name] = balanced
+        total_tokens_by_layer[layer_name] = sum(ex.get("token_count", 0) for ex in balanced)
+        total_examples_by_layer[layer_name] = len(balanced)
+        logger.info(
+            "    [%s] → %d examples, %d tokens (target %d)",
+            layer_name, len(balanced), total_tokens_by_layer[layer_name], target_tokens,
+        )
+
+    # ── Write balanced outputs ─────────────────────────────────────────────
+    for layer_name, balanced in balanced_by_layer.items():
+        output_path = CHUNKS_DIR / f"{layer_name}_chunks_filtered.jsonl"
+        write_jsonl(output_path, balanced)
+        filtered_paths[layer_name] = output_path
+
+    # ── Final ratio check ──────────────────────────────────────────────────
     grand_total_tokens = sum(total_tokens_by_layer.values())
     if grand_total_tokens > 0:
         logger.info("  Token ratio check:")
@@ -1552,7 +1928,7 @@ def phase_filter_and_balance(logger: logging.Logger) -> Dict[str, Path]:
         # Tiger Style: assert ratios are within tolerance.
         assert abs(code_pct - TARGET_CODE_PCT) <= RATIO_TOLERANCE, (
             f"Code ratio {code_pct:.1%} outside tolerance ±{RATIO_TOLERANCE:.0%} "
-            f"(target {TARGET_CODE_PCT:.0%}). Add more code examples."
+            f"(target {TARGET_CODE_PCT:.0%})."
         )
         assert abs(doc_pct - TARGET_DOC_PCT) <= RATIO_TOLERANCE, (
             f"Doc ratio {doc_pct:.1%} outside tolerance ±{RATIO_TOLERANCE:.0%}."
