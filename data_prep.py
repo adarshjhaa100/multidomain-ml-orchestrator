@@ -199,6 +199,7 @@ MODELS_DIR = PROJECT_ROOT / "models"
 MAX_FILE_LINES = 5000        # Skip generated/amalgamated files
 MIN_CHUNK_LINES = 3          # Below this: trivial (getter/setter)
 MAX_CHUNK_LINES = 200        # Above this: too large for 3B model context
+MAX_INSTRUCTION_CODE_CHARS = 2000  # Max code chars passed to the LLM prompt (speed/quality trade-off)
 MAX_TOKENS_PER_EXAMPLE = 2048
 MIN_TOKENS_PER_EXAMPLE = 8
 MAX_INSTRUCTION_GEN_RETRIES = 3
@@ -821,7 +822,7 @@ def _generate_instruction(
       - Output validation: length check, refusal check, copy check.
       - Returns None on failure (explicit), never empty string.
     """
-    prompt = INSTRUCTION_PROMPT_TEMPLATE.format(language=language, code=code[:3000])
+    prompt = INSTRUCTION_PROMPT_TEMPLATE.format(language=language, code=code[:MAX_INSTRUCTION_CODE_CHARS])
     # Bounds check: prompt must be non-empty and reasonable length.
     assert len(prompt) > 50, f"Prompt too short ({len(prompt)} chars)"
     assert len(prompt) < 8192, f"Prompt too long ({len(prompt)} chars)"
@@ -890,9 +891,13 @@ def _generate_instructions_batched(
     saved_count = 0
     generation_failures = 0
     pbar = tqdm(total=total_to_process, desc="  Generating instructions (batched)")
+    _batch_t0 = time.monotonic()
+    _log_interval = max(50, total_to_process // 100)
 
     try:
+        batch_num = 0
         while queue:
+            batch_num += 1
             wave = []
             while queue and len(wave) < llm.n_parallel:
                 wave.append(queue.popleft())
@@ -900,7 +905,7 @@ def _generate_instructions_batched(
             reqs = [
                 {
                     "prompt": INSTRUCTION_PROMPT_TEMPLATE.format(
-                        language=c["language"], code=c["code"][:3000]
+                        language=c["language"], code=c["code"][:MAX_INSTRUCTION_CODE_CHARS]
                     ),
                     "max_tokens": 128,
                     "temperature": 0.7,
@@ -909,7 +914,18 @@ def _generate_instructions_batched(
                 for _, c, _ in wave
             ]
 
+            _wave_t0 = time.monotonic()
             texts = llm.complete_batch(reqs)
+            _wave_dt = time.monotonic() - _wave_t0
+
+            if batch_num % _log_interval == 0:
+                _elapsed = time.monotonic() - _batch_t0
+                avg_prompt_toks = sum(len(c.get("code", "")) for _, c, _ in wave) / len(wave) if wave else 0
+                logger.info(
+                    "  Batch %d: %d prompts in %.1fs (%.2fs/prompt, avg %.0f code chars, %d saved/%d failed)",
+                    batch_num, len(wave), _wave_dt, _wave_dt / max(len(wave), 1),
+                    avg_prompt_toks, saved_count, generation_failures,
+                )
 
             for (idx, chunk, attempts), text in zip(wave, texts):
                 if text is not None:
