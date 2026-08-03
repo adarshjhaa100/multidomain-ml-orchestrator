@@ -19,9 +19,71 @@ The final mixture must satisfy:
 
 ---
 
+## How to Run
+
+The full pipeline is driven by two files in the project root:
+
+| File | Purpose |
+|------|---------|
+| `data_prep.py` | Python pipeline orchestrator (all phases) |
+| `run_data_prep.sh` | Bash runner — pre-flight checks, venv, model download, invokes `data_prep.py` |
+
+**Recommended (bash runner):**
+```bash
+# Full pipeline (clone → chunk → instruct → docs → align → filter → mix → validate):
+./run_data_prep.sh
+
+# Single phase (resumes from checkpoint):
+./run_data_prep.sh --phase instruct
+
+# Multiple comma-separated phases:
+./run_data_prep.sh --phase chunk,instruct
+
+# Smoke test (quick LM Studio backend validation):
+./run_data_prep.sh --smoke-test
+
+# Skip model auto-download (use an existing model file):
+./run_data_prep.sh --skip-model-download
+
+# Verbose debug logging:
+./run_data_prep.sh --verbose
+```
+
+**Direct Python (without bash wrapper):**
+```bash
+# Set up environment first:
+uv venv
+uv pip install -r requirements.txt
+
+# Download model:
+huggingface-cli download Qwen/Qwen2.5-Coder-1.5B-Instruct-GGUF \
+    qwen2.5-coder-1.5b-instruct-q4_k_m.gguf --local-dir models/
+
+# Run individual phases:
+uv run python data_prep.py --phase all
+uv run python data_prep.py --phase instruct   # batched if LM Studio detected
+uv run python data_prep.py --phase align      # batched if LM Studio detected
+```
+
+**Checkpoints:** Each phase writes to a checkpoint file in `data/chunks/`. If a
+phase is re-run, it skips already-processed records and resumes from where it left
+off. For a fresh run, delete the corresponding checkpoint file.
+
+**Quick validation (LM Studio backend):**
+```bash
+uv run python tests/smoke_batched_llm.py
+```
+
+---
+
 ## Local Model for Synthetic Instruction Generation
 
-All instruction generation is done **locally** using `llama-cpp-python` running a small GGUF model. No cloud APIs.
+All instruction generation is done **locally** using a small GGUF model. By default
+the pipeline uses the [`llama-cpp-python`](https://github.com/abetlen/llama-cpp-python)
+bindings. If [LM Studio](https://lmstudio.ai) is installed its CUDA backend is
+auto-detected (`~/.lmstudio/extensions/backends/llama.cpp-*-cuda-*`) and used for
+**dynamic batched inference**, giving roughly 2–3× higher throughput on a 4 GB
+GPU (see [Batched Inference](#batched-llm-inference-via-lm-studio) below).
 
 **Recommended model:** `Qwen2.5-Coder-1.5B-Instruct` (GGUF Q4_K_M)
 - **Why:** Specifically trained for code understanding and instruction following. 1.5B params runs comfortably on CPU (~1 GB RAM, ~15 tok/s). Generates high-quality natural-language instructions from raw code.
@@ -524,22 +586,73 @@ Step 7: Shuffle + write data/train.jsonl + data/stats.json
 Step 8: Validate structure, ratios, quality
 ```
 
-## Python Script Architecture
+## Batched LLM Inference via LM Studio
 
-The script that implements this will live at `dataset_builder/main.py` and will be structured as:
+The default serial loop processes one code chunk per `llama_decode` call, keeping
+the GPU memory-bandwidth-bound and idle most of the time. On an RTX 3050 Laptop
+(4 GB, 192 GB/s) the 58k chunk instruction generation ran for >30 hours in serial
+mode.
+
+When LM Studio is installed its bundled `libllama.so` (llama.cpp b8733) is loaded
+directly — no compilation, no server process, no network round-trip. The low-level
+batch API (`llama_batch_init`, `llama_decode` with multiple sequences) decodes all
+active sequences in one forward pass, sharing the weight read across all N sequences:
+
+- **Prefill phase:** all prompts are tokenised and decoded in one call.
+- **Decode loop:** one `llama_decode` per step produces N tokens (one per sequence).
+- **Pipeline:** Each step reads the 934 MiB model weights once and reuses them for
+  all N sequences, giving ~N× the single-sequence decode throughput.
+
+On a 4 GB RTX 3050 the pipeline runs at `n_parallel=12` with 2048 tokens per
+sequence, consuming ~2.8 GB VRAM. Measured throughput for 128-token completions:
+
+| Mode              | 12 completions | Per-request rate | Wall-clock (58k chunks) |
+|-------------------|----------------|------------------|-------------------------|
+| Serial (old)      | ~24 s          | 0.5 req/s        | >30 h                   |
+| Batched (LM Studio)| ~12 s          | 1.0 req/s         | ~15 h (estimated)       |
+
+**Auto-detection:** `data_prep.py` calls `find_lmstudio_backend()` at runtime.
+If a compatible CUDA backend is found (`~/.lmstudio/extensions/backends/llama.cpp-*-cuda-*`)
+the batched path is used automatically. Otherwise it falls back to the serial
+`llama-cpp-python` path — no configuration needed.
+
+**Warm-up workaround:** This particular LM Studio llama.cpp build (b8733,
+commit d6f3030) requires a warm-up sequence of one CPU-only model load followed
+by a deliberately-failing GPU no-mmap load before the real GPU mmap load succeeds.
+The `BatchedLlama` class handles this transparently at ~5 s startup cost.
+Future LM Studio backend versions may not need this workaround.
+
+**When to skip LM Studio:**
+- The model file doesn't exist → no LLM expansion at all, seeds only.
+- `find_lmstudio_backend()` returns `None` → serial `llama-cpp-python` path.
+- Any exception during `BatchedLlama.start()` → logged as warning, serial fallback.
+
+## File Layout
+
+The pipeline lives in the project root:
 
 ```
-dataset_builder/
-├── main.py              # CLI entry point: orchestrates all steps
-├── code_scraper.py      # Steps 1, 2, 3
-├── doc_scraper.py       # Step 4
-├── alignment_builder.py # Step 5
-├── synth_generator.py   # Local LLM wrapper (shared by Steps 3, 5)
-├── validator.py         # Steps 6, 7, 8
-└── utils.py             # JSONL I/O, logging, token counting
+├── data_prep.py              # CLI entry point: orchestrates all phases (Steps 1–8)
+├── llm_backend.py            # LM Studio batched LLM backend (ctypes bindings to libllama.so)
+├── run_data_prep.sh          # Bash runner — pre-flight checks, venv, model, invokes data_prep.py
+├── tests/
+│   └── smoke_batched_llm.py  # Quick smoke test for the LM Studio backend
+├── data/
+│   └── chunks/               # Checkpoint files (code_chunks_raw, _ready, doc_, alignment_)
+├── models/                   # GGUF model files (qwen2.5-coder-1.5b-instruct-q4_k_m.gguf)
+├── input_data/               # Cloned repos, scraped docs, alignment seeds
+└── docs/
+    └── data-prep-stage-instructions.md  # This document
 ```
 
-Each module will be independently runnable so we can:
-- Resume from checkpoint if a step fails (e.g., network timeout during scraping)
-- Re-run only one layer if we change the data mix
-- Run tests on each module separately
+Key design properties:
+- **Single Python file:** `data_prep.py` contains all phases — no module hierarchy to
+  navigate. Each phase is a self-contained function with an `assert`-enforced contract.
+- **Batched inference lives in `llm_backend.py`:** a self-contained ctypes wrapper
+  around LM Studio's `libllama.so`. The two modules share no state except through the
+  global `_batched_llm_instance` / `_llm_instance` pointers (exactly one of which is
+  set at any time).
+- **Resumable:** Checkpoint files in `data/chunks/` let each phase skip already-done
+  work. Delete the checkpoint to force a re-run.
+- **Independently runnable phases:** The `--phase` CLI flag accepts a single phase or
+  comma-separated list (e.g., `--phase chunk,instruct`).

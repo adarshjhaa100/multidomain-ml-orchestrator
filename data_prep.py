@@ -101,6 +101,43 @@ except ImportError:
 # ── Local LLM for synthetic instruction generation ────────────────────────
 # This is optional — only needed for --phase instruct or --phase align.
 _llm_instance: Any = None
+_batched_llm_instance: Any = None
+
+
+def _load_batched_llm(model_path: str, logger: logging.Logger) -> Any:
+    """Lazy-load the LM Studio llama.cpp backend for batched inference.
+
+    Tiger Style: explicit check-then-use. Returns None (never raises) when no
+    LM Studio CUDA backend is installed, so callers fall back to the serial
+    llama-cpp-python path. The backend folder is consulted first, as the user
+    requested — no build, no server, no download.
+    """
+    global _batched_llm_instance
+    if _batched_llm_instance is not None:
+        return _batched_llm_instance
+    try:
+        from llm_backend import BatchedLlama, find_lmstudio_backend
+    except ImportError:
+        logger.debug("  llm_backend not importable — using serial llama-cpp-python path")
+        return None
+    info = find_lmstudio_backend()
+    if info is None:
+        logger.debug("  No LM Studio llama.cpp backend found — using serial llama-cpp-python path")
+        return None
+    try:
+        _batched_llm_instance = BatchedLlama(
+            str(model_path),
+            n_parallel=12,
+            ctx_per_seq=2048,
+            logger=logger,
+        )
+        _batched_llm_instance.start()
+    except Exception as exc:
+        logger.warning("  LM Studio backend failed to start (%s) — falling back to serial", exc)
+        _batched_llm_instance = None
+        return None
+    logger.info("  Batched LM Studio backend ready (%s)", info["backend_dir"])
+    return _batched_llm_instance
 
 
 def _load_llm(model_path: str, n_threads: Optional[int] = None) -> Any:
@@ -736,6 +773,41 @@ CODE:
 INSTRUCTION:"""
 
 
+def _validate_instruction(
+    instruction: Optional[str],
+    code: str,
+    logger: Optional[logging.Logger],
+) -> Optional[str]:
+    """Apply the instruction quality filters; return the instruction or None.
+
+    Tiger Style: shared by the serial and batched generation paths so both
+    accept exactly the same outputs.
+    """
+    if not instruction:
+        return None
+
+    if len(instruction) < 5:
+        if logger:
+            logger.debug("  Rejected: instruction too short (%d chars)", len(instruction))
+        return None
+
+    if instruction.lower().startswith(("i cannot", "i'm unable", "i am unable", "sorry")):
+        if logger:
+            logger.debug("  Rejected: model refused")
+        return None
+
+    # Check if model just echoed the code back.
+    code_words = set(code.lower().split()[:20])
+    inst_words = set(instruction.lower().split())
+    overlap = len(code_words & inst_words)
+    if overlap > len(code_words) * 0.8 and len(code_words) > 5:
+        if logger:
+            logger.debug("  Rejected: instruction copies code (%.0f%% overlap)", overlap / len(code_words) * 100)
+        return None
+
+    return instruction
+
+
 def _generate_instruction(
     llm: Any,
     language: str,
@@ -762,7 +834,9 @@ def _generate_instruction(
                 temperature=0.7,
                 stop=["\n\n"],
             )
-            instruction = response["choices"][0]["text"].strip()
+            instruction = _validate_instruction(
+                response["choices"][0]["text"].strip(), code, logger
+            )
         except Exception as exc:
             logger.debug("  LLM generation attempt %d failed: %s", attempt, exc)
             if attempt == MAX_INSTRUCTION_GEN_RETRIES:
@@ -770,26 +844,131 @@ def _generate_instruction(
             time.sleep(1)
             continue
 
-        # ── Quality filters (Tiger Style: explicit reject reasons) ──────────
-        if len(instruction) < 5:
-            logger.debug("  Rejected: instruction too short (%d chars)", len(instruction))
-            continue
-
-        if instruction.lower().startswith(("i cannot", "i'm unable", "i am unable", "sorry")):
-            logger.debug("  Rejected: model refused")
-            continue
-
-        # Check if model just echoed the code back.
-        code_words = set(code.lower().split()[:20])
-        inst_words = set(instruction.lower().split())
-        overlap = len(code_words & inst_words)
-        if overlap > len(code_words) * 0.8 and len(code_words) > 5:
-            logger.debug("  Rejected: instruction copies code (%.0f%% overlap)", overlap / len(code_words) * 100)
-            continue
-
-        return instruction
+        if instruction is not None:
+            return instruction
 
     return None
+
+
+def _make_instruct_record(instruction: str, chunk: Dict[str, Any]) -> Dict[str, Any]:
+    """Build the output record shape for a validated instruction."""
+    return {
+        "instruction": instruction,
+        "input": "",
+        "output": chunk["code"],
+        "metadata": {
+            "layer": "code",
+            "language": chunk["language"],
+            "repo": chunk["repo"],
+            "chunk_name": chunk.get("name", "unknown"),
+        },
+    }
+
+
+def _generate_instructions_batched(
+    llm: Any,
+    chunks: List[Dict[str, Any]],
+    completed: int,
+    output_path: Path,
+    logger: logging.Logger,
+) -> Tuple[int, int]:
+    """Generate instructions using the LM Studio batched backend.
+
+    Returns (saved_count, generation_failures).
+    """
+    from collections import deque
+
+    queue: deque = deque()
+    total_to_process = 0
+    for idx, chunk in enumerate(chunks):
+        if idx < completed:
+            continue
+        queue.append((idx, chunk, MAX_INSTRUCTION_GEN_RETRIES))
+        total_to_process += 1
+
+    fout = open(output_path, "ab")
+    saved_count = 0
+    generation_failures = 0
+    pbar = tqdm(total=total_to_process, desc="  Generating instructions (batched)")
+
+    try:
+        while queue:
+            wave = []
+            while queue and len(wave) < llm.n_parallel:
+                wave.append(queue.popleft())
+
+            reqs = [
+                {
+                    "prompt": INSTRUCTION_PROMPT_TEMPLATE.format(
+                        language=c["language"], code=c["code"][:3000]
+                    ),
+                    "max_tokens": 128,
+                    "temperature": 0.7,
+                    "stop": ["\n\n"],
+                }
+                for _, c, _ in wave
+            ]
+
+            texts = llm.complete_batch(reqs)
+
+            for (idx, chunk, attempts), text in zip(wave, texts):
+                if text is not None:
+                    instruction = _validate_instruction(text, chunk["code"], logger)
+                else:
+                    instruction = None
+
+                if instruction is None:
+                    if attempts > 1:
+                        queue.append((idx, chunk, attempts - 1))
+                    else:
+                        generation_failures += 1
+                        pbar.update(1)
+                    continue
+
+                record = _make_instruct_record(instruction, chunk)
+                fout.write(orjson.dumps(record, option=orjson.OPT_APPEND_NEWLINE))
+                fout.flush()
+                saved_count += 1
+                pbar.update(1)
+    finally:
+        fout.close()
+        pbar.close()
+
+    return saved_count, generation_failures
+
+
+def _generate_instructions_serial(
+    llm: Any,
+    chunks: List[Dict[str, Any]],
+    completed: int,
+    output_path: Path,
+    logger: logging.Logger,
+) -> Tuple[int, int]:
+    """Generate instructions one-at-a-time via llama-cpp-python (fallback)."""
+    generation_failures = 0
+    saved_count = 0
+
+    fout = open(output_path, "ab")
+    try:
+        for idx, chunk in enumerate(tqdm(chunks, desc="  Generating instructions")):
+            if idx < completed:
+                continue
+
+            instruction = _generate_instruction(
+                llm, chunk["language"], chunk["code"], logger
+            )
+            if instruction is None:
+                generation_failures += 1
+                continue
+
+            record = _make_instruct_record(instruction, chunk)
+            fout.write(orjson.dumps(record, option=orjson.OPT_APPEND_NEWLINE))
+            fout.flush()
+            saved_count += 1
+    finally:
+        fout.close()
+
+    return saved_count, generation_failures
 
 
 def phase_generate_instructions(logger: logging.Logger) -> Path:
@@ -821,47 +1000,25 @@ def phase_generate_instructions(logger: logging.Logger) -> Path:
     )
 
     model_path_str = str(model_path)
-    _llm_instance = None  # Fresh load with GPU
-    llm = _load_llm(model_path_str)
 
     completed = 0
     if output_path.exists():
         completed = sum(1 for _ in open(output_path, "rb") if _.strip())
         logger.info("  Resuming from checkpoint: %d chunks already done", completed)
 
-    generation_failures = 0
-    saved_count = 0
-
     ensure_dir(output_path.parent)
-    fout = open(output_path, "ab")
 
-    for idx, chunk in enumerate(tqdm(chunks, desc="  Generating instructions")):
-        if idx < completed:
-            continue
-
-        instruction = _generate_instruction(
-            llm, chunk["language"], chunk["code"], logger
+    # Prefer the batched LM Studio backend; fall back to serial llama-cpp-python.
+    batched = _load_batched_llm(model_path_str, logger)
+    if batched is not None:
+        saved_count, generation_failures = _generate_instructions_batched(
+            batched, chunks, completed, output_path, logger
         )
-        if instruction is None:
-            generation_failures += 1
-            continue
-
-        record = {
-            "instruction": instruction,
-            "input": "",
-            "output": chunk["code"],
-            "metadata": {
-                "layer": "code",
-                "language": chunk["language"],
-                "repo": chunk["repo"],
-                "chunk_name": chunk.get("name", "unknown"),
-            },
-        }
-        fout.write(orjson.dumps(record, option=orjson.OPT_APPEND_NEWLINE))
-        fout.flush()
-        saved_count += 1
-
-    fout.close()
+    else:
+        llm = _load_llm(model_path_str)
+        saved_count, generation_failures = _generate_instructions_serial(
+            llm, chunks, completed, output_path, logger
+        )
 
     total_done = completed + saved_count
     logger.info(
@@ -1590,6 +1747,128 @@ def _expand_alignment_examples(
     return expanded[:target_count]
 
 
+def _expand_alignment_examples_batched(
+    seed_examples: List[Dict[str, Any]],
+    blm: Any,
+    logger: logging.Logger,
+    target_count: int = 500,
+) -> List[Dict[str, Any]]:
+    """Expand seed examples using the LM Studio batched backend.
+
+    Unlike the serial version which calls the LLM 2-3 times per (principle, lang)
+    pair, this version collects all bad-code prompts for a round, batch-decodes
+    them, then batch-decodes the corresponding good-code prompts.  The 65 (principle,
+    lang) pairs complete in ~5-6 waves of n_parallel=12 each instead of 65 serial
+    decode pairs.
+    """
+    expanded: List[Dict[str, Any]] = list(seed_examples)
+    seen_outputs: set = set(compute_blake3(ex["output"]) for ex in expanded)
+    target_languages = ["c", "python", "javascript", "html", "css"]
+    principles = list(PRINCIPLE_HINTS.keys())
+    round_num = 0
+    max_rounds = 60
+
+    while len(expanded) < target_count and round_num < max_rounds:
+        round_num += 1
+
+        # Build the candidate list for this round: every (principle, lang) pair.
+        candidates: List[Tuple[str, str]] = []
+        for principle in principles:
+            for lang in target_languages:
+                if len(expanded) + len(candidates) >= target_count:
+                    break
+                candidates.append((principle, lang))
+            if len(expanded) + len(candidates) >= target_count:
+                break
+
+        if not candidates:
+            break
+
+        # ── Phase A: generate bad code for all candidates ───────────────────
+        bad_reqs = [
+            {
+                "prompt": (
+                    f"Write a short {lang} function that has this flaw: "
+                    f"{PRINCIPLE_HINTS.get(principle, 'it violates Tiger Style principles')}. "
+                    f"Keep it under 15 lines. Output only the code:\n"
+                ),
+                "max_tokens": 256,
+                "temperature": 0.8,
+                "stop": ["\n\n"],
+            }
+            for principle, lang in candidates
+        ]
+        bad_texts = blm.complete_batch(bad_reqs)
+
+        valid_bad: List[Tuple[str, str, str]] = []
+        for (principle, lang), bad_text in zip(candidates, bad_texts):
+            if not bad_text:
+                continue
+            bad = _strip_code_fences(bad_text.strip())
+            if len(bad) >= 10:
+                valid_bad.append((principle, lang, bad))
+
+        if not valid_bad:
+            logger.debug("  Alignment: no valid bad code in round %d", round_num)
+            break
+
+        # ── Phase B: generate good code for each successful bad code ─────────
+        good_reqs = [
+            {
+                "prompt": (
+                    f"Here is a {lang} function that violates '{principle}':\n"
+                    f"{bad}\n\n"
+                    f"Here is the corrected version that complies with '{principle}':\n"
+                ),
+                "max_tokens": 256,
+                "temperature": 0.7,
+                "stop": ["\n\n"],
+            }
+            for principle, lang, bad in valid_bad
+        ]
+        good_texts = blm.complete_batch(good_reqs)
+
+        made_progress = False
+        for (principle, lang, bad), good_text in zip(valid_bad, good_texts):
+            if not good_text:
+                continue
+            good = _strip_code_fences(good_text.strip())
+            if len(good) < 10:
+                continue
+
+            output = f"<thought>Fixing '{principle}' in {lang}.</thought>\n\n{good}"
+            output_hash = compute_blake3(output)
+            if output_hash in seen_outputs:
+                continue
+            seen_outputs.add(output_hash)
+
+            expanded.append({
+                "instruction": (
+                    f"Refactor this {lang} code to comply with Tiger Style: "
+                    f"{principle}"
+                ),
+                "input": bad,
+                "output": output,
+                "metadata": {
+                    "layer": "alignment",
+                    "principle": principle,
+                    "language": lang,
+                },
+            })
+            made_progress = True
+
+            if len(expanded) >= target_count:
+                break
+
+        if not made_progress:
+            logger.warning("  Alignment batched: no new examples in round %d — stopping", round_num)
+            break
+
+    logger.info("  Alignment batched expansion: %d examples after %d rounds", len(expanded), round_num)
+    random.shuffle(expanded)
+    return expanded[:target_count]
+
+
 def phase_build_alignment(logger: logging.Logger) -> Path:
     """Phase 5: Build alignment examples (Tiger Style + design principles).
 
@@ -1604,16 +1883,26 @@ def phase_build_alignment(logger: logging.Logger) -> Path:
     logger.info("=== Phase 5: Building alignment examples ===")
 
     model_path = MODELS_DIR / "qwen2.5-coder-1.5b-instruct-q4_k_m.gguf"
-    if not model_path.exists():
+    model_exists = model_path.exists()
+    model_path_str = str(model_path) if model_exists else ""
+
+    if not model_exists:
         logger.warning(
             "  Model not found at %s. Using seed examples only (no LLM expansion).",
             model_path,
         )
+        blm = None
         llm = None
     else:
-        llm = _load_llm(str(model_path))
+        # Prefer the LM Studio batched backend.
+        blm = _load_batched_llm(model_path_str, logger)
+        if blm is None:
+            llm = _load_llm(model_path_str)
+        else:
+            llm = None
 
-    # Build seed examples with thought traces.
+    # Build seed examples. With the batched backend we use hardcoded thought
+    # text (there are only ~18 seeds — not worth a batch call).
     seed_results: List[Dict[str, Any]] = []
     for seed in SEED_EXAMPLES:
         if llm:
@@ -1638,7 +1927,11 @@ def phase_build_alignment(logger: logging.Logger) -> Path:
     logger.info("  Seed alignment examples: %d", len(seed_results))
 
     # Expand to more examples via LLM (if available).
-    if llm:
+    if blm:
+        expanded = _expand_alignment_examples_batched(seed_results, blm, logger, target_count=500)
+        logger.info("  Expanded to %d examples via batched LLM", len(expanded))
+        all_alignment = expanded
+    elif llm:
         expanded = _expand_alignment_examples(seed_results, llm, logger, target_count=500)
         logger.info("  Expanded to %d examples via LLM", len(expanded))
         all_alignment = expanded

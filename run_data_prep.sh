@@ -20,6 +20,7 @@
 #   ./run_data_prep.sh --phase chunk,instruct  # Multiple comma-separated phases
 #   ./run_data_prep.sh --verbose               # Full debug logging
 #   ./run_data_prep.sh --skip-model-download   # Skip automatic model download
+#   ./run_data_prep.sh --smoke-test            # Quick smoke test of batched LLM
 # =============================================================================
 
 set -euo pipefail  # Tiger Style: fail fast, no silent errors, catch unset vars
@@ -68,6 +69,7 @@ echo ""
 PHASE="all"
 VERBOSE=""
 SKIP_MODEL_DOWNLOAD=false
+SMOKE_TEST=false
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -80,6 +82,9 @@ while [[ $# -gt 0 ]]; do
             ;;
         --skip-model-download)
             SKIP_MODEL_DOWNLOAD=true
+            ;;
+        --smoke-test)
+            SMOKE_TEST=true
             ;;
         --help|-h)
             head -30 "$0" | grep "^#  " | sed 's/^#  //'
@@ -116,7 +121,56 @@ else
     uv pip install huggingface-hub
 fi
 
+# ── Check LM Studio backend (batched LLM inference) ─────────────────────────
+
+BACKEND_DIR=$(uv run python3 -c "
+import sys; sys.path.insert(0, '.')
+try:
+    from llm_backend import find_lmstudio_backend
+    info = find_lmstudio_backend()
+    if info:
+        print(info['backend_dir'])
+    else:
+        print('')
+except Exception:
+    print('')
+" 2>/dev/null)
+
+if [[ -n "$BACKEND_DIR" ]]; then
+    log_ok "LM Studio llama.cpp CUDA backend found (batched mode)"
+    log_info "  Backend: $BACKEND_DIR"
+else
+    log_info "No LM Studio CUDA backend detected — using serial llama-cpp-python path"
+    log_info "  (Install LM Studio at https://lmstudio.ai for up to 3x faster generation)"
+fi
+
 echo ""
+
+if [[ "$SMOKE_TEST" == true ]]; then
+    log_info "Running batched LLM smoke test..."
+    uv run python -c "
+import sys, tempfile, orjson
+from pathlib import Path
+sys.path.insert(0, '.')
+from llm_backend import BatchedLlama, find_lmstudio_backend
+info = find_lmstudio_backend()
+if info is None:
+    print('[SKIP] No LM Studio backend found')
+    sys.exit(0)
+chunks = [
+    {'language': 'python', 'code': 'def add(a, b): return a + b', 'repo': 'test', 'name': 'add'},
+    {'language': 'c',      'code': 'int inc(int x) { return x + 1; }',  'repo': 'test', 'name': 'inc'},
+]
+with BatchedLlama('models/qwen2.5-coder-1.5b-instruct-q4_k_m.gguf', n_parallel=4, ctx_per_seq=1536) as llm:
+    reqs = [{'prompt': f'Write an instruction for: {c[\"code\"]}', 'max_tokens': 64, 'temperature': 0.7, 'stop': ['\\n\\n']} for c in chunks]
+    texts = llm.complete_batch(reqs)
+    for c, t in zip(chunks, texts):
+        print(f'  [{c[\"language\"]:>8}] {t[:60] if t else \"(failed)\"}')
+print('OK')
+" 2>&1
+    log_ok "Smoke test complete"
+    exit 0
+fi
 
 # ── Step 0b: Create uv virtual environment and install deps ────────────────
 
