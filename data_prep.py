@@ -890,6 +890,7 @@ def _generate_instructions_batched(
     fout = open(output_path, "ab")
     saved_count = 0
     generation_failures = 0
+    retry_count = 0
     pbar = tqdm(total=total_to_process, desc="  Generating instructions (batched)")
     _batch_t0 = time.monotonic()
     _log_interval = max(50, total_to_process // 100)
@@ -918,15 +919,7 @@ def _generate_instructions_batched(
             texts = llm.complete_batch(reqs)
             _wave_dt = time.monotonic() - _wave_t0
 
-            if batch_num % _log_interval == 0:
-                _elapsed = time.monotonic() - _batch_t0
-                avg_prompt_toks = sum(len(c.get("code", "")) for _, c, _ in wave) / len(wave) if wave else 0
-                logger.info(
-                    "  Batch %d: %d prompts in %.1fs (%.2fs/prompt, avg %.0f code chars, %d saved/%d failed)",
-                    batch_num, len(wave), _wave_dt, _wave_dt / max(len(wave), 1),
-                    avg_prompt_toks, saved_count, generation_failures,
-                )
-
+            wave_retries = 0
             for (idx, chunk, attempts), text in zip(wave, texts):
                 if text is not None:
                     instruction = _validate_instruction(text, chunk["code"], logger)
@@ -936,6 +929,7 @@ def _generate_instructions_batched(
                 if instruction is None:
                     if attempts > 1:
                         queue.append((idx, chunk, attempts - 1))
+                        wave_retries += 1
                     else:
                         generation_failures += 1
                         pbar.update(1)
@@ -946,6 +940,18 @@ def _generate_instructions_batched(
                 fout.flush()
                 saved_count += 1
                 pbar.update(1)
+            retry_count += wave_retries
+
+            if batch_num % _log_interval == 0:
+                _elapsed = time.monotonic() - _batch_t0
+                rate = saved_count / _elapsed if _elapsed > 0 else 0
+                avg_code_chars = sum(len(c.get("code", "")) for _, c, _ in wave) / len(wave) if wave else 0
+                logger.info(
+                    "  Batch %d: %d prompts in %.1fs (%.2fs/prompt, avg %.0f code chars, "
+                    "%d saved/%d failed/%d retrying, %.2f chunks/s)",
+                    batch_num, len(wave), _wave_dt, _wave_dt / max(len(wave), 1),
+                    avg_code_chars, saved_count, generation_failures, retry_count, rate,
+                )
     finally:
         fout.close()
         pbar.close()

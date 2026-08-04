@@ -571,7 +571,14 @@ class BatchedLlama:
         return results
 
     def _complete_sub_batch(self, requests: List[Dict[str, Any]]) -> List[Optional[str]]:
-        # Per-sequence state.
+        # Clear KV cache for every seq_id we are about to use.  A previous sub-batch
+        # may have left stale positions in the memory module for the same seq_ids,
+        # and llama.cpp requires consecutive positions per sequence (Y = X + 1).
+        # Without this flush any retried request hits "inconsistent sequence positions".
+        n = len(requests)
+        for i in range(n):
+            self._free_seq(i)
+
         seqs = []
         for i, req in enumerate(requests):
             prompt = req["prompt"]
@@ -597,6 +604,10 @@ class BatchedLlama:
         try:
             self._run_batch(batch, seqs)
         finally:
+            # Always free every seq_id we used, even when _run_batch raised or a
+            # sequence failed mid-way -- stale KV entries crash the next sub-batch.
+            for i in range(n):
+                self._free_seq(i)
             self._lib.llama_batch_free(batch)
 
         out: List[Optional[str]] = []
@@ -630,6 +641,9 @@ class BatchedLlama:
                 for j, tok in enumerate(s["prompt"]):
                     self._batch_add(batch, tok, j, s["id"], logits=(j == n - 1))
             if batch.n_tokens > 0 and self._lib.llama_decode(self._ctx, batch) != 0:
+                self._log(logging.WARNING,
+                          "  Batch prefill decode failed (%d tokens across %d seqs)",
+                          batch.n_tokens, len(seqs))
                 for s in seqs:
                     s["failed"] = True
                 return
@@ -664,6 +678,10 @@ class BatchedLlama:
                 if batch.n_tokens == 0:
                     break
                 if self._lib.llama_decode(self._ctx, batch) != 0:
+                    self._log(logging.WARNING,
+                              "  Decode loop step %d failed (%d tokens, %d active seqs)",
+                              steps, batch.n_tokens,
+                              sum(1 for s in seqs if s["active"]))
                     for s in seqs:
                         if s["active"]:
                             s["failed"] = True
