@@ -1,5 +1,5 @@
 """
-data_prep.py — Phase C: Dataset Construction (The 60/25/15 Rule)
+data_prep.py — Phase C: Dataset Construction (The 50/25/15/10 Rule)
 ================================================================
 
 Builds train.jsonl from 3 layers:
@@ -104,6 +104,101 @@ _llm_instance: Any = None
 _batched_llm_instance: Any = None
 
 
+def _orchestrator_plan(
+    model_path: str,
+    cpu_workers: Optional[int] = None,
+    cpu_threads: Optional[int] = None,
+    gpu_parallel: Optional[int] = None,
+    logger: Optional[logging.Logger] = None,
+    sample_jobs: Optional[List[Dict[str, Any]]] = None,
+) -> List[Any]:
+    """Return the orchestrator worker plan (GPU batched + CPU workers).
+
+    Uses live hardware probing so the machine decides, and lets the CLI force
+    a mix for benchmarking (see --cpu-workers / --cpu-threads / --gpu-parallel).
+
+    When nothing is forced, the plan is *calibrated*: the orchestrator runs the
+    candidate mixes (gpu-only, +1cpu, +2cpu) on a sample of the real job and
+    keeps whichever gives the highest throughput per machine.
+    """
+    from orchestrator import calibrate_plan, plan_llm_resources, probe
+
+    res = probe()
+    forced = cpu_workers is not None or cpu_threads is not None or gpu_parallel is not None
+    ctx = 2048
+
+    if not forced and sample_jobs:
+        specs = calibrate_plan(res, model_path, sample_jobs, ctx_per_seq=ctx, logger=logger)
+        if logger:
+            logger.info("  Orchestrator plan (calibrated, %s):", res.gpu.name or "no-GPU")
+            for s in specs:
+                logger.info("    worker %-5s kind=%-3s threads=%-2d n_parallel=%-2d ctx=%d",
+                            s.name, s.kind, s.n_threads, s.n_parallel, s.ctx_per_seq)
+        return specs
+
+    specs = plan_llm_resources(
+        res,
+        model_path,
+        ctx_per_seq=ctx,
+        max_cpu_workers=cpu_workers,
+        cpu_threads_each=cpu_threads if cpu_threads else 2,
+        max_parallel=gpu_parallel if gpu_parallel else 12,
+    )
+    if logger:
+        logger.info("  Orchestrator plan (%s):", res.gpu.name or "no-GPU")
+        for s in specs:
+            logger.info("    worker %-5s kind=%-3s threads=%-2d n_parallel=%-2d ctx=%d",
+                        s.name, s.kind, s.n_threads, s.n_parallel, s.ctx_per_seq)
+    return specs
+
+
+def _run_orchestrated(
+    model_path: str,
+    jobs: List[Dict[str, Any]],
+    raw_out: Path,
+    specs: List[Any],
+    logger: logging.Logger,
+) -> Dict[str, Any]:
+    """Run a completion job across the orchestrator fleet; return stats.
+
+    `jobs[i]` is a request dict ({"prompt", "max_tokens", ...}). `raw_out` is a
+    per-run temp file; each line is the request merged with {"_idx", "_text"}.
+    """
+    from orchestrator import run_llm_completions
+    return run_llm_completions(
+        jobs, raw_out, specs, model_path, logger=logger, force_regen=True,
+    )
+
+
+def _orchestrator_complete(
+    model_path: str,
+    jobs: List[Dict[str, Any]],
+    specs: List[Any],
+    logger: logging.Logger,
+    run_dir: Optional[Path] = None,
+) -> List[Optional[str]]:
+    """Run jobs through the fleet and return texts in input order.
+
+    Small wrapper around `_run_orchestrated` for callers that only need the
+    decoded texts back (e.g. alignment expansion).
+    """
+    if not jobs:
+        return []
+    raw_out = CHUNKS_DIR / f"orch_raw_{uuid.uuid4().hex[:8]}.jsonl"
+    from orchestrator import run_llm_completions
+    stats = run_llm_completions(
+        jobs, raw_out, specs, model_path, logger=logger,
+        force_regen=True, run_dir=run_dir,
+    )
+    texts: Dict[int, Optional[str]] = {}
+    if raw_out.exists():
+        for line in open(raw_out, "rb"):
+            rec = orjson.loads(line)
+            texts[rec["_idx"]] = rec["_text"]
+        raw_out.unlink(missing_ok=True)
+    return [texts.get(i) for i in range(len(jobs))]
+
+
 def _load_batched_llm(model_path: str, logger: logging.Logger) -> Any:
     """Lazy-load the LM Studio llama.cpp backend for batched inference.
 
@@ -206,9 +301,12 @@ MAX_INSTRUCTION_GEN_RETRIES = 3
 REQUEST_DELAY_SECONDS = 0.5  # Polite scraping delay
 
 # Tiger Style: target ratios with explicit tolerance bounds.
-TARGET_CODE_PCT = 0.60
+# Phase C rule: 50% code / 25% docs & fundamentals / 15% style & alignment /
+# 10% devops, logs & harness operations (measured in tokens, not examples).
+TARGET_CODE_PCT = 0.50
 TARGET_DOC_PCT = 0.25
 TARGET_ALIGN_PCT = 0.15
+TARGET_DEVOPS_PCT = 0.10
 RATIO_TOLERANCE = 0.03       # ±3% allowed deviation
 
 # ── Repository definitions ────────────────────────────────────────────────
@@ -993,13 +1091,22 @@ def _generate_instructions_serial(
     return saved_count, generation_failures
 
 
-def phase_generate_instructions(logger: logging.Logger) -> Path:
+def phase_generate_instructions(
+    logger: logging.Logger,
+    instruct_limit: Optional[int] = None,
+    cpu_workers: Optional[int] = None,
+    cpu_threads: Optional[int] = None,
+    gpu_parallel: Optional[int] = None,
+) -> Path:
     """Phase 3: Generate synthetic instructions for every code chunk.
 
     Tiger Style:
       - Lazy-loads the LLM (no wasted resources if this phase is skipped).
       - Processes chunks in deterministic order with progress bar.
       - Writes filtered results — chunks that failed generation are dropped.
+      - Uses the resource-aware orchestrator (GPU batched + CPU workers) so
+        every memory bus on the machine is busy; falls back to the old serial
+        path only if the orchestrator cannot start.
     """
     output_path = CHUNKS_DIR / "code_chunks_ready.jsonl"
     if _check_checkpoint(output_path, "generated instructions", min_records=50, logger=logger):
@@ -1012,6 +1119,9 @@ def phase_generate_instructions(logger: logging.Logger) -> Path:
     )
 
     chunks = read_jsonl(input_path)
+    if instruct_limit is not None:
+        chunks = chunks[:instruct_limit]
+        logger.info("  (limited to first %d chunks)", len(chunks))
     logger.info("  Loaded %d code chunks", len(chunks))
 
     model_path = MODELS_DIR / "qwen2.5-coder-1.5b-instruct-q4_k_m.gguf"
@@ -1028,18 +1138,89 @@ def phase_generate_instructions(logger: logging.Logger) -> Path:
         completed = sum(1 for _ in open(output_path, "rb") if _.strip())
         logger.info("  Resuming from checkpoint: %d chunks already done", completed)
 
+    remaining = chunks[completed:]
+    if not remaining:
+        logger.info("  All chunks already processed — nothing to do.")
+        return output_path
+
     ensure_dir(output_path.parent)
 
-    # Prefer the batched LM Studio backend; fall back to serial llama-cpp-python.
+    jobs = [
+        {
+            "prompt": INSTRUCTION_PROMPT_TEMPLATE.format(
+                language=c["language"], code=c["code"][:MAX_INSTRUCTION_CODE_CHARS]
+            ),
+            "max_tokens": 128,
+            "temperature": 0.7,
+            "stop": ["\n\n"],
+        }
+        for c in remaining
+    ]
+
+    try:
+        specs = _orchestrator_plan(
+            model_path_str, cpu_workers, cpu_threads, gpu_parallel, logger,
+            sample_jobs=jobs[:60] if cpu_workers is None and gpu_parallel is None else None,
+        )
+        if not specs:
+            raise RuntimeError("orchestrator planned no workers")
+    except Exception as exc:
+        logger.warning("  Orchestrator unavailable (%s) — falling back to batched/serial", exc)
+        specs = []
+
+    if specs:
+        # Stable raw output name so an interrupted run can be resumed on the
+        # next invocation (run_llm_completions seeds from the .partial file and
+        # only does the missing jobs). Unlinked on success.
+        raw_out = CHUNKS_DIR / "instruct_raw.jsonl"
+        stats = _run_orchestrated(model_path_str, jobs, raw_out, specs, logger)
+        logger.info("  Orchestrator stats: %s", {
+            k: v for k, v in stats.items() if k in ("ok", "failed", "elapsed_s", "jobs_per_s")
+        })
+
+        # Map raw results back to validated records, in original chunk order.
+        results: Dict[int, Dict[str, Any]] = {}
+        for line in open(raw_out, "rb"):
+            rec = orjson.loads(line)
+            results[rec["_idx"]] = rec
+        raw_out.unlink(missing_ok=True)
+
+        saved_count = 0
+        generation_failures = 0
+        with open(output_path, "ab") as fout:
+            for i, chunk in enumerate(remaining):
+                rec = results.get(i)
+                text = rec["_text"] if rec else None
+                instruction = _validate_instruction(text, chunk["code"], logger)
+                if instruction is None:
+                    generation_failures += 1
+                    continue
+                record = _make_instruct_record(instruction, chunk)
+                fout.write(orjson.dumps(record, option=orjson.OPT_APPEND_NEWLINE))
+                saved_count += 1
+        total_done = completed + saved_count
+        logger.info(
+            "  Generated: %d / %d chunks (%.1f%% success, %d failures)",
+            total_done, len(chunks),
+            total_done / max(len(chunks), 1) * 100,
+            generation_failures,
+        )
+        logger.info("  Written: %s (%d examples)", output_path, total_done)
+        assert total_done > 50, (
+            f"Only {total_done} successful generations. Check model or chunks."
+        )
+        return output_path
+
+    # ── Fallback: legacy batched LM Studio backend, then serial ───────────
     batched = _load_batched_llm(model_path_str, logger)
     if batched is not None:
         saved_count, generation_failures = _generate_instructions_batched(
-            batched, chunks, completed, output_path, logger
+            batched, remaining, 0, output_path, logger
         )
     else:
         llm = _load_llm(model_path_str)
         saved_count, generation_failures = _generate_instructions_serial(
-            llm, chunks, completed, output_path, logger
+            llm, remaining, 0, output_path, logger
         )
 
     total_done = completed + saved_count
@@ -1769,6 +1950,106 @@ def _expand_alignment_examples(
     return expanded[:target_count]
 
 
+def _expand_alignment_examples_orchestrated(
+    seed_examples: List[Dict[str, Any]],
+    model_path: str,
+    specs: List[Any],
+    logger: logging.Logger,
+    target_count: int = 500,
+) -> List[Dict[str, Any]]:
+    """Expand seed examples using the orchestrator fleet (GPU + CPU).
+
+    The (principle, lang) bad-code generations are independent, so they are all
+    sent to the fleet in ONE batch; the good-code fix prompts depend on the bad
+    outputs, so they go in a second fleet batch.  Two fleet startups total,
+    instead of one per round.
+    """
+    expanded: List[Dict[str, Any]] = list(seed_examples)
+    seen_outputs: set = set(compute_blake3(ex["output"]) for ex in expanded)
+    target_languages = ["c", "python", "javascript", "html", "css"]
+    principles = list(PRINCIPLE_HINTS.keys())
+    combos = [(p, l) for p in principles for l in target_languages]
+
+    # Number of (principle, lang) repeats needed to *likely* reach target_count:
+    # ~50% of bad codes are valid and ~80% of those yield unique examples.
+    needed = max(1, int(target_count / (len(combos) * 0.4)))
+    candidates: List[Tuple[str, str]] = (combos * needed)[:needed * len(combos)]
+
+    bad_reqs = [
+        {
+            "prompt": (
+                f"Write a short {lang} function that has this flaw: "
+                f"{PRINCIPLE_HINTS.get(principle, 'it violates Tiger Style principles')}. "
+                f"Keep it under 15 lines. Output only the code:\n"
+            ),
+            "max_tokens": 256,
+            "temperature": 0.8,
+            "stop": ["\n\n"],
+        }
+        for principle, lang in candidates
+    ]
+    logger.info("  Alignment: requesting %d bad-code generations via orchestrator", len(bad_reqs))
+    bad_texts = _orchestrator_complete(model_path, bad_reqs, specs, logger)
+    bad_texts = bad_texts + [None] * (len(bad_reqs) - len(bad_texts))
+
+    valid: List[Tuple[str, str, str]] = []
+    for (principle, lang), bt in zip(candidates, bad_texts):
+        if not bt:
+            continue
+        bad = _strip_code_fences(bt.strip())
+        if len(bad) >= 10:
+            valid.append((principle, lang, bad))
+
+    logger.info("  Alignment: %d valid bad-code snippets → good-code pass", len(valid))
+    if valid:
+        good_reqs = [
+            {
+                "prompt": (
+                    f"Here is a {lang} function that violates '{principle}':\n"
+                    f"{bad}\n\n"
+                    f"Here is the corrected version that complies with '{principle}':\n"
+                ),
+                "max_tokens": 256,
+                "temperature": 0.7,
+                "stop": ["\n\n"],
+            }
+            for principle, lang, bad in valid
+        ]
+        good_texts = _orchestrator_complete(model_path, good_reqs, specs, logger)
+        good_texts = good_texts + [None] * (len(good_reqs) - len(good_texts))
+
+        for (principle, lang, bad), gt in zip(valid, good_texts):
+            if not gt:
+                continue
+            good = _strip_code_fences(gt.strip())
+            if len(good) < 10:
+                continue
+            output = f"<thought>Fixing '{principle}' in {lang}.</thought>\n\n{good}"
+            output_hash = compute_blake3(output)
+            if output_hash in seen_outputs:
+                continue
+            seen_outputs.add(output_hash)
+            expanded.append({
+                "instruction": (
+                    f"Refactor this {lang} code to comply with Tiger Style: "
+                    f"{principle}"
+                ),
+                "input": bad,
+                "output": output,
+                "metadata": {
+                    "layer": "alignment",
+                    "principle": principle,
+                    "language": lang,
+                },
+            })
+            if len(expanded) >= target_count:
+                break
+
+    logger.info("  Alignment orchestrator expansion: %d examples", len(expanded))
+    random.shuffle(expanded)
+    return expanded[:target_count]
+
+
 def _expand_alignment_examples_batched(
     seed_examples: List[Dict[str, Any]],
     blm: Any,
@@ -1948,8 +2229,20 @@ def phase_build_alignment(logger: logging.Logger) -> Path:
 
     logger.info("  Seed alignment examples: %d", len(seed_results))
 
-    # Expand to more examples via LLM (if available).
-    if blm:
+    # Expand to more examples via the orchestrator fleet if we can plan workers.
+    try:
+        specs = _orchestrator_plan(model_path_str, 4, None, None, logger)
+    except Exception as exc:
+        logger.warning("  Orchestrator unavailable for alignment (%s)", exc)
+        specs = []
+
+    if specs:
+        expanded = _expand_alignment_examples_orchestrated(
+            seed_results, model_path_str, specs, logger, target_count=500,
+        )
+        logger.info("  Expanded to %d examples via orchestrator fleet", len(expanded))
+        all_alignment = expanded
+    elif blm:
         expanded = _expand_alignment_examples_batched(seed_results, blm, logger, target_count=500)
         logger.info("  Expanded to %d examples via batched LLM", len(expanded))
         all_alignment = expanded
@@ -2021,6 +2314,253 @@ def phase_build_alignment(logger: logging.Logger) -> Path:
 
 # =============================================================================
 # %%
+# Phase 5b: DevOps, Logs & Harness Layer (10% of the mixture)
+# =============================================================================
+# What the model needs from this layer: reproducible build environments
+# (Makefiles, Dockerfiles), service supervision (systemd), and structured
+# logging formats that a deterministic harness can parse.  Seeds are
+# hand-crafted so this layer never depends on scraping or a live model.
+
+DEVOPS_SEEDS: List[Dict[str, str]] = [
+    {
+        "instruction": "Write a Makefile with build, test, and clean targets for a C project with a single source file.",
+        "output": (
+            "CC ?= cc\n"
+            "CFLAGS ?= -std=c11 -O2 -Wall -Wextra -Werror\n"
+            "SRC := main.c\n"
+            "BIN := app\n\n"
+            ".PHONY: all test clean\n\n"
+            "all: $(BIN)\n\n"
+            "$(BIN): $(SRC)\n"
+            "\t$(CC) $(CFLAGS) -o $@ $<\n\n"
+            "test: $(BIN)\n"
+            "\t./$(BIN) --selftest\n\n"
+            "clean:\n"
+            "\trm -f $(BIN)\n"
+        ),
+    },
+    {
+        "instruction": "Write a multi-stage Dockerfile that builds a small static C binary and runs it in scratch.",
+        "output": (
+            "FROM gcc:13 AS build\n"
+            "WORKDIR /src\n"
+            "COPY main.c .\n"
+            "RUN gcc -std=c11 -O2 -static -o app main.c\n\n"
+            "FROM scratch\n"
+            "COPY --from=build /src/app /app\n"
+            "ENTRYPOINT [\"/app\"]\n"
+        ),
+    },
+    {
+        "instruction": "Write a systemd service unit that keeps a Python worker running with restart-on-failure.",
+        "output": (
+            "[Unit]\n"
+            "Description=worker service\n"
+            "After=network.target\n\n"
+            "[Service]\n"
+            "Type=simple\n"
+            "User=worker\n"
+            "WorkingDirectory=/opt/worker\n"
+            "ExecStart=/opt/worker/.venv/bin/python main.py\n"
+            "Restart=on-failure\n"
+            "RestartSec=2\n"
+            "MemoryMax=512M\n"
+            "CPUQuota=200%\n"
+            "StandardOutput=journal\n"
+            "StandardError=journal\n\n"
+            "[Install]\n"
+            "WantedBy=multi-user.target\n"
+        ),
+    },
+    {
+        "instruction": "Write a Python logging configuration that emits JSON lines a harness can parse.",
+        "output": (
+            "import json, logging, time\n\n"
+            "class JsonFormatter(logging.Formatter):\n"
+            "    def format(self, record):\n"
+            "        return json.dumps({\n"
+            "            'ts': time.time(),\n"
+            "            'level': record.levelname,\n"
+            "            'logger': record.name,\n"
+            "            'msg': record.getMessage(),\n"
+            "        })\n\n"
+            "def configure():\n"
+            "    h = logging.StreamHandler()\n"
+            "    h.setFormatter(JsonFormatter())\n"
+            "    logging.basicConfig(handlers=[h], level=logging.INFO)\n"
+        ),
+    },
+    {
+        "instruction": "Write a GitHub Actions workflow that runs tests on every push.",
+        "output": (
+            "name: ci\n"
+            "on: [push]\n"
+            "jobs:\n"
+            "  test:\n"
+            "    runs-on: ubuntu-latest\n"
+            "    steps:\n"
+            "      - uses: actions/checkout@v4\n"
+            "      - uses: actions/setup-python@v5\n"
+            "        with:\n"
+            "          python-version: '3.12'\n"
+            "      - run: pip install -r requirements.txt\n"
+            "      - run: pytest tests/\n"
+        ),
+    },
+    {
+        "instruction": "Write a shell script that builds the project with strict error checking and logs each phase to stderr.",
+        "output": (
+            "#!/usr/bin/env bash\n"
+            "set -euo pipefail\n\n"
+            "log() { printf '[build] %s\\n' \"$*\" >&2; }\n\n"
+            "log 'configuring'\n"
+            "cmake -B build -DCMAKE_BUILD_TYPE=Release\n\n"
+            "log 'building'\n"
+            "cmake --build build -j$(nproc)\n\n"
+            "log 'testing'\n"
+            "ctest --test-dir build --output-on-failure\n\n"
+            "log 'done'\n"
+        ),
+    },
+    {
+        "instruction": "Write a docker-compose.yml that runs an app and a postgres service with healthchecks.",
+        "output": (
+            "services:\n"
+            "  app:\n"
+            "    build: .\n"
+            "    ports: [\"8080:8080\"]\n"
+            "    depends_on:\n"
+            "      db:\n"
+            "        condition: service_healthy\n"
+            "  db:\n"
+            "    image: postgres:16\n"
+            "    environment:\n"
+            "      POSTGRES_PASSWORD: dev\n"
+            "    healthcheck:\n"
+            "      test: [\"CMD-SHELL\", \"pg_isready -U postgres\"]\n"
+            "      interval: 5s\n"
+            "      timeout: 3s\n"
+            "      retries: 5\n"
+        ),
+    },
+    {
+        "instruction": "Write a structured JSON log line for a failed request including request id and latency.",
+        "output": (
+            "{\n"
+            "  \"ts\": 1710000000.123,\n"
+            "  \"level\": \"ERROR\",\n"
+            "  \"request_id\": \"a1b2c3\",\n"
+            "  \"method\": \"GET\",\n"
+            "  \"path\": \"/v1/items\",\n"
+            "  \"status\": 500,\n"
+            "  \"latency_ms\": 231.4,\n"
+            "  \"msg\": \"upstream timeout\"\n"
+            "}"
+        ),
+    },
+    {
+        "instruction": "Write a systemd timer that runs a nightly database backup.",
+        "output": (
+            "[Unit]\n"
+            "Description=nightly backup\n\n"
+            "[Timer]\n"
+            "OnCalendar=*-*-* 02:00:00\n"
+            "Persistent=true\n\n"
+            "[Install]\n"
+            "WantedBy=timers.target\n"
+        ),
+    },
+    {
+        "instruction": "Write an nginx server block that serves a static site and sets security headers.",
+        "output": (
+            "server {\n"
+            "  listen 80;\n"
+            "  server_name example.com;\n"
+            "  root /srv/www;\n"
+            "  index index.html;\n"
+            "  add_header X-Content-Type-Options nosniff;\n"
+            "  add_header X-Frame-Options DENY;\n"
+            "  add_header Referrer-Policy strict-origin-when-cross-origin;\n"
+            "  location / {\n"
+            "    try_files $uri $uri/ /index.html;\n"
+            "  }\n"
+            "}\n"
+        ),
+    },
+    {
+        "instruction": "Write a simple .gitignore for a Python project that excludes virtualenvs and caches.",
+        "output": (
+            "__pycache__/\n"
+            "*.py[cod]\n"
+            ".venv/\n"
+            "venv/\n"
+            ".pytest_cache/\n"
+            ".mypy_cache/\n"
+            "*.egg-info/\n"
+            "dist/\n"
+            "build/\n"
+            "data/*.jsonl\n"
+        ),
+    },
+    {
+        "instruction": "Write a Makefile target that runs a linter and a formatter check in CI.",
+        "output": (
+            ".PHONY: lint fmt-check\n\n"
+            "lint:\n"
+            "\trufflehog filesystem --directory . --fail || true\n"
+            "\tflake8 src tests\n\n"
+            "fmt-check:\n"
+            "\tblack --check src tests\n"
+            "\tisort --check-only src tests\n"
+        ),
+    },
+]
+
+
+def _build_devops_seeds() -> List[Dict[str, Any]]:
+    """Deterministic DevOps layer — every seed becomes one training example."""
+    examples: List[Dict[str, Any]] = []
+    for i, seed in enumerate(DEVOPS_SEEDS):
+        examples.append({
+            "instruction": seed["instruction"],
+            "input": "",
+            "output": seed["output"],
+            "metadata": {
+                "layer": "devops",
+                "language": "devops",
+                "source": "seed",
+            },
+        })
+    return examples
+
+
+def phase_build_devops(logger: logging.Logger) -> Path:
+    """Phase 5b: DevOps, logs & harness layer (10%).
+
+    Tiger Style:
+      - Seeds are deterministic and auditable (no scraping, no LLM needed).
+      - Optional LLM expansion is skipped unless the fleet is available.
+      - Post-condition: devops_chunks.jsonl has at least 10 examples.
+    """
+    output_path = CHUNKS_DIR / "devops_chunks.jsonl"
+    if _check_checkpoint(output_path, "devops examples", min_records=10, logger=logger):
+        return output_path
+    logger.info("=== Phase 5b: Building devops/logs examples ===")
+
+    all_devops = _build_devops_seeds()
+    logger.info("  DevOps seeds: %d examples", len(all_devops))
+
+    assert len(all_devops) >= 10, (
+        f"Only {len(all_devops)} devops examples."
+    )
+
+    write_jsonl(output_path, all_devops)
+    logger.info("  Written: %s (%d examples)", output_path, len(all_devops))
+    return output_path
+
+
+# =============================================================================
+# %%
 # Phase 6: Token Accounting & Quality Filtering
 # =============================================================================
 
@@ -2085,31 +2625,33 @@ def phase_filter_and_balance(logger: logging.Logger) -> Dict[str, Path]:
     Tiger Style:
       - Every example is validated against MIN/MAX token bounds.
       - Exact deduplication by output hash.
-      - Proportional subsampling brings layers to the 60/25/15 token ratio.
+      - Proportional subsampling brings layers to the 50/25/15/10 token ratio.
       - Post-condition: each layer file has < 2048 tokens per example.
 
     Returns:
         Dict mapping layer name → filtered file path.
     """
-    # Check if all three filtered files already exist.
+    # Check if all four filtered files already exist.
+    layers = ["code", "doc", "alignment", "devops"]
     all_exist = all(
         (CHUNKS_DIR / f"{layer}_chunks_filtered.jsonl").exists()
-        for layer in ["code", "doc", "alignment"]
+        for layer in layers
     )
     if all_exist:
         sizes = {
             layer: (CHUNKS_DIR / f"{layer}_chunks_filtered.jsonl").stat().st_size
-            for layer in ["code", "doc", "alignment"]
+            for layer in layers
         }
         total_mb = sum(sizes.values()) / (1024 * 1024)
-        logger.info("=== Phase 6: All 3 filtered files exist (%.1f MB total) — skipping.", total_mb)
-        return {layer: CHUNKS_DIR / f"{layer}_chunks_filtered.jsonl" for layer in ["code", "doc", "alignment"]}
+        logger.info("=== Phase 6: All 4 filtered files exist (%.1f MB total) — skipping.", total_mb)
+        return {layer: CHUNKS_DIR / f"{layer}_chunks_filtered.jsonl" for layer in layers}
     logger.info("=== Phase 6: Token accounting & filtering ===")
 
     layer_files = {
         "code":      CHUNKS_DIR / "code_chunks_ready.jsonl",
         "doc":       CHUNKS_DIR / "doc_chunks.jsonl",
         "alignment": CHUNKS_DIR / "alignment_chunks.jsonl",
+        "devops":    CHUNKS_DIR / "devops_chunks.jsonl",
     }
 
     filtered_paths: Dict[str, Path] = {}
@@ -2187,6 +2729,7 @@ def phase_filter_and_balance(logger: logging.Logger) -> Dict[str, Path]:
         "code": TARGET_CODE_PCT,
         "doc": TARGET_DOC_PCT,
         "alignment": TARGET_ALIGN_PCT,
+        "devops": TARGET_DEVOPS_PCT,
     }
     available_tokens = {
         layer: sum(ex.get("token_count", 0) for ex in examples)
@@ -2201,9 +2744,9 @@ def phase_filter_and_balance(logger: logging.Logger) -> Dict[str, Path]:
         if layer in filtered_by_layer
     )
     logger.info(
-        "  Balancing 3 layers to %d/%d/%d (binding total ≈ %.0f tokens)",
+        "  Balancing 4 layers to %d/%d/%d/%d (binding total ≈ %.0f tokens)",
         int(TARGET_CODE_PCT * 100), int(TARGET_DOC_PCT * 100),
-        int(TARGET_ALIGN_PCT * 100), max_total,
+        int(TARGET_ALIGN_PCT * 100), int(TARGET_DEVOPS_PCT * 100), max_total,
     )
 
     balanced_by_layer: Dict[str, List[Dict[str, Any]]] = {}
@@ -2235,10 +2778,12 @@ def phase_filter_and_balance(logger: logging.Logger) -> Dict[str, Path]:
         code_pct = total_tokens_by_layer.get("code", 0) / grand_total_tokens
         doc_pct = total_tokens_by_layer.get("doc", 0) / grand_total_tokens
         align_pct = total_tokens_by_layer.get("alignment", 0) / grand_total_tokens
+        devops_pct = total_tokens_by_layer.get("devops", 0) / grand_total_tokens
 
         logger.info("    Code:      %.1f%% (target: %.0f%%)", code_pct * 100, TARGET_CODE_PCT * 100)
         logger.info("    Docs:      %.1f%% (target: %.0f%%)", doc_pct * 100, TARGET_DOC_PCT * 100)
         logger.info("    Alignment: %.1f%% (target: %.0f%%)", align_pct * 100, TARGET_ALIGN_PCT * 100)
+        logger.info("    Devops:    %.1f%% (target: %.0f%%)", devops_pct * 100, TARGET_DEVOPS_PCT * 100)
 
         # Tiger Style: assert ratios are within tolerance.
         assert abs(code_pct - TARGET_CODE_PCT) <= RATIO_TOLERANCE, (
@@ -2250,6 +2795,9 @@ def phase_filter_and_balance(logger: logging.Logger) -> Dict[str, Path]:
         )
         assert abs(align_pct - TARGET_ALIGN_PCT) <= RATIO_TOLERANCE, (
             f"Alignment ratio {align_pct:.1%} outside tolerance ±{RATIO_TOLERANCE:.0%}."
+        )
+        assert abs(devops_pct - TARGET_DEVOPS_PCT) <= RATIO_TOLERANCE, (
+            f"Devops ratio {devops_pct:.1%} outside tolerance ±{RATIO_TOLERANCE:.0%}."
         )
         logger.info("    ✓ All ratios within ±%.0f%% tolerance", RATIO_TOLERANCE * 100)
 
@@ -2392,7 +2940,7 @@ def phase_validate(logger: logging.Logger) -> bool:
         logger.info("  ✓ All lines valid JSON with required keys")
 
     # ── Check 4: Token ratio within tolerance ─────────────────────────────
-    layer_tokens: Dict[str, int] = {"code": 0, "doc": 0, "alignment": 0}
+    layer_tokens: Dict[str, int] = {"code": 0, "doc": 0, "alignment": 0, "devops": 0}
     for line in lines:
         line = line.strip()
         if not line:
@@ -2409,9 +2957,10 @@ def phase_validate(logger: logging.Logger) -> bool:
         code_pct = layer_tokens["code"] / total
         doc_pct = layer_tokens["doc"] / total
         align_pct = layer_tokens["alignment"] / total
+        devops_pct = layer_tokens["devops"] / total
 
-        logger.info("  Token ratios: Code %.1f%%, Doc %.1f%%, Align %.1f%%",
-                     code_pct * 100, doc_pct * 100, align_pct * 100)
+        logger.info("  Token ratios: Code %.1f%%, Doc %.1f%%, Align %.1f%%, Devops %.1f%%",
+                     code_pct * 100, doc_pct * 100, align_pct * 100, devops_pct * 100)
 
         if abs(code_pct - TARGET_CODE_PCT) > RATIO_TOLERANCE:
             logger.error("  FAIL: Code ratio %.1f%% outside tolerance", code_pct * 100)
@@ -2421,6 +2970,9 @@ def phase_validate(logger: logging.Logger) -> bool:
             all_pass = False
         if abs(align_pct - TARGET_ALIGN_PCT) > RATIO_TOLERANCE:
             logger.error("  FAIL: Alignment ratio %.1f%% outside tolerance", align_pct * 100)
+            all_pass = False
+        if abs(devops_pct - TARGET_DEVOPS_PCT) > RATIO_TOLERANCE:
+            logger.error("  FAIL: Devops ratio %.1f%% outside tolerance", devops_pct * 100)
             all_pass = False
 
         if all_pass:
@@ -2481,7 +3033,7 @@ def _parse_args() -> argparse.Namespace:
     Tiger Style: every option has help text, type validation, and default.
     """
     parser = argparse.ArgumentParser(
-        description="Phase C: Dataset Construction (60/25/15 Rule) for SmolLM3 fine-tuning",
+        description="Phase C: Dataset Construction (50/25/15/10 Rule) for SmolLM3 fine-tuning",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=textwrap.dedent("""\
             Examples:
@@ -2494,7 +3046,7 @@ def _parse_args() -> argparse.Namespace:
         "--phase",
         type=str,
         default="all",
-        help="Phase(s) to run: all, clone, chunk, instruct, docs, align, filter, mix, validate. "
+        help="Phase(s) to run: all, clone, chunk, instruct, docs, align, devops, filter, mix, validate. "
              "Comma-separated for multiple.",
     )
     parser.add_argument(
@@ -2507,6 +3059,32 @@ def _parse_args() -> argparse.Namespace:
         type=str,
         default=str(MODELS_DIR / "qwen2.5-coder-1.5b-instruct-q4_k_m.gguf"),
         help="Path to the GGUF model for instruction generation.",
+    )
+    parser.add_argument(
+        "--instruct-limit",
+        type=int,
+        default=None,
+        help="Process only the first N code chunks in the instruct phase "
+             "(useful for benchmarking the orchestrator on real data).",
+    )
+    parser.add_argument(
+        "--cpu-workers",
+        type=int,
+        default=None,
+        help="Force the number of CPU workers in the orchestrator plan "
+             "(default: auto from CPU/RAM probe).",
+    )
+    parser.add_argument(
+        "--cpu-threads",
+        type=int,
+        default=None,
+        help="Threads per CPU worker (default: 2).",
+    )
+    parser.add_argument(
+        "--gpu-parallel",
+        type=int,
+        default=None,
+        help="Max sequences per GPU forward pass (default: auto from VRAM).",
     )
     return parser.parse_args()
 
@@ -2523,12 +3101,12 @@ def main() -> int:
     logger = _setup_logging(verbose=args.verbose)
 
     logger.info("=" * 60)
-    logger.info("Data Preparation — Phase C: 60/25/15 Dataset Construction")
+    logger.info("Data Preparation — Phase C: 50/25/15/10 Dataset Construction")
     logger.info("=" * 60)
 
     # Determine which phases to run.
     if args.phase == "all":
-        phases = ["clone", "chunk", "instruct", "docs", "align", "filter", "mix", "validate"]
+        phases = ["clone", "chunk", "instruct", "docs", "align", "devops", "filter", "mix", "validate"]
     else:
         phases = [p.strip() for p in args.phase.split(",") if p.strip()]
 
@@ -2553,13 +3131,22 @@ def main() -> int:
             phase_chunk_code(logger)
 
         elif phase_name == "instruct":
-            phase_generate_instructions(logger)
+            phase_generate_instructions(
+                logger,
+                instruct_limit=args.instruct_limit,
+                cpu_workers=args.cpu_workers,
+                cpu_threads=args.cpu_threads,
+                gpu_parallel=args.gpu_parallel,
+            )
 
         elif phase_name == "docs":
             phase_scrape_docs(logger)
 
         elif phase_name == "align":
             phase_build_alignment(logger)
+
+        elif phase_name == "devops":
+            phase_build_devops(logger)
 
         elif phase_name == "filter":
             filtered_paths = phase_filter_and_balance(logger)
@@ -2571,6 +3158,7 @@ def main() -> int:
                     "code":      CHUNKS_DIR / "code_chunks_filtered.jsonl",
                     "doc":       CHUNKS_DIR / "doc_chunks_filtered.jsonl",
                     "alignment": CHUNKS_DIR / "alignment_chunks_filtered.jsonl",
+                    "devops":    CHUNKS_DIR / "devops_chunks_filtered.jsonl",
                 }
                 # Check which ones actually exist.
                 filtered_paths = {
@@ -2588,7 +3176,7 @@ def main() -> int:
 
         else:
             logger.error("Unknown phase: %s. Valid: %s", phase_name,
-                         "all, clone, chunk, instruct, docs, align, filter, mix, validate")
+                         "all, clone, chunk, instruct, docs, align, devops, filter, mix, validate")
             return 1
 
     logger.info("=" * 60)

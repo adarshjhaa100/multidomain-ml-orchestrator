@@ -1,4 +1,4 @@
-# Data Preparation Stage — Phase C: Dataset Construction (The 60/25/15 Rule)
+# Data Preparation Stage — Phase C: Dataset Construction (The 50/25/15/10 Rule)
 
 ## Purpose
 
@@ -11,9 +11,10 @@ The final mixture must satisfy:
 
 | Layer | Ratio | Source | Purpose |
 |---|---|---|---|
-| Code | 60% | SQLite, Redis, Starlette, Rich, HTTPX, Alpine.js, htmx, Pico.css | Ground model in concrete, executable syntax |
+| Code | 50% | SQLite, Redis, Starlette, Rich, HTTPX, Alpine.js, htmx, Pico.css | Ground model in concrete, executable syntax |
 | Docs | 25% | cppreference.com, docs.python.org, MDN | Teach exact API signatures and usage facts |
 | Alignment | 15% | Tiger Style guide, low-level design principles, whitepapers | Instill disciplined, safety-first coding habits |
+| Devops/Logs | 10% | Config formats, shell/CI snippets, structured logs, CLI usage | Teach operational tooling, YAML/TOML, log formats, deployment patterns |
 
 **Target size:** 10,000–25,000 total examples (sufficient for LoRA fine-tuning a 3B model over 2–3 epochs without overfitting).
 
@@ -47,6 +48,12 @@ The full pipeline is driven by two files in the project root:
 
 # Verbose debug logging:
 ./run_data_prep.sh --verbose
+
+# Benchmark the orchestrator on the first 100 real chunks:
+./run_data_prep.sh --phase instruct --instruct-limit 100
+
+# Force a specific worker mix (GPU + N CPU workers / GPU batch size):
+./run_data_prep.sh --phase instruct --cpu-workers 2 --gpu-parallel 8
 ```
 
 **Direct Python (without bash wrapper):**
@@ -78,12 +85,12 @@ uv run python tests/smoke_batched_llm.py
 
 ## Local Model for Synthetic Instruction Generation
 
-All instruction generation is done **locally** using a small GGUF model. By default
-the pipeline uses the [`llama-cpp-python`](https://github.com/abetlen/llama-cpp-python)
-bindings. If [LM Studio](https://lmstudio.ai) is installed its CUDA backend is
-auto-detected (`~/.lmstudio/extensions/backends/llama.cpp-*-cuda-*`) and used for
-**dynamic batched inference**, giving roughly 2–3× higher throughput on a 4 GB
-GPU (see [Batched Inference](#batched-llm-inference-via-lm-studio) below).
+All instruction generation is done **locally** using a small GGUF model. The
+instruct phase runs through the **resource-aware orchestrator** (`orchestrator.py`),
+which probes the machine and auto-splits the job across GPU and CPU workers (see
+[Orchestrator](#resource-aware-orchestrator) below). If LM Studio is installed its
+CUDA backend is auto-detected (`~/.lmstudio/extensions/backends/llama.cpp-*-cuda-*`)
+and used for **dynamic batched inference** on the GPU worker.
 
 **Recommended model:** `Qwen2.5-Coder-1.5B-Instruct` (GGUF Q4_K_M)
 - **Why:** Specifically trained for code understanding and instruction following. 1.5B params runs comfortably on CPU (~1 GB RAM, ~15 tok/s). Generates high-quality natural-language instructions from raw code.
@@ -147,7 +154,7 @@ huggingface-cli download Qwen/Qwen2.5-Coder-1.5B-Instruct-GGUF \
 
 ---
 
-### Step 1: Clone Target Repositories (60% Code Layer)
+### Step 1: Clone Target Repositories (50% Code Layer)
 
 **What:** Clone the 8 approved repositories into `input_data/repos/`.
 
@@ -189,7 +196,7 @@ for repo in REPOS:
 
 ---
 
-### Step 2: Chunk Code with tree-sitter (60% Code Layer)
+### Step 2: Chunk Code with tree-sitter (50% Code Layer)
 
 **What:** Parse every source file with tree-sitter and extract individual function and class definitions as discrete chunks.
 
@@ -248,7 +255,7 @@ For each approved source file:
 
 ---
 
-### Step 3: Generate Synthetic Instructions for Code Chunks (60% Code Layer)
+### Step 3: Generate Synthetic Instructions for Code Chunks (50% Code Layer)
 
 **What:** For every code chunk, use the local GGUF model to generate a natural-language instruction that a human would give to elicit exactly that code as output.
 
@@ -472,13 +479,13 @@ For each seed example:
 
 ### Step 6: Token Accounting & Quality Filtering
 
-**Why:** The 60/25/15 ratio must be measured in *tokens seen during training*, not just example counts. A 10-line C function and a 3-page design document have very different token counts.
+**Why:** The 50/25/15/10 ratio must be measured in *tokens seen during training*, not just example counts. A 10-line C function and a 3-page design document have very different token counts.
 
 **Action:**
 ```python
 tokenizer = AutoTokenizer.from_pretrained("HuggingFaceTB/SmolLM3-3B")
 
-for layer in ["code", "doc", "alignment"]:
+for layer in ["code", "doc", "alignment", "devops"]:
     examples = read_jsonl(f"data/chunks/{layer}_chunks.jsonl")
     for ex in examples:
         total_tokens = len(tokenizer.encode(ex["instruction"] + ex["output"]))
@@ -499,7 +506,7 @@ After token counting, if a layer is over/under-represented in token-space:
 - Under: pad with additional examples (re-generate from unused chunks)
 - Over: subsample the longest examples first (they contribute disproportionately)
 
-**Target token ratios:** 60% (±3%) code, 25% (±3%) docs, 15% (±3%) alignment.
+**Target token ratios:** 50% (±3%) code, 25% (±3%) docs, 15% (±3%) alignment, 10% (±3%) devops.
 
 ---
 
@@ -508,7 +515,7 @@ After token counting, if a layer is over/under-represented in token-space:
 **Action:**
 ```python
 all_examples = []
-for layer in ["code", "doc", "alignment"]:
+for layer in ["code", "doc", "alignment", "devops"]:
     examples = read_jsonl(f"data/chunks/{layer}_chunks_filtered.jsonl")
     all_examples.extend(examples)
 
@@ -522,9 +529,10 @@ write_jsonl("data/train.jsonl", all_examples)
 {
   "total_examples": 15000,
   "total_tokens": 12500000,
-  "code_layer": {"examples": 9000, "tokens": 7500000, "pct": 60.0},
+  "code_layer": {"examples": 7500, "tokens": 6250000, "pct": 50.0},
   "doc_layer": {"examples": 3750, "tokens": 3125000, "pct": 25.0},
   "alignment_layer": {"examples": 2250, "tokens": 1875000, "pct": 15.0},
+  "devops_layer": {"examples": 1500, "tokens": 1250000, "pct": 10.0},
   "languages": {"c": {"examples": 4000, "tokens": 5000000}, ...}
 }
 ```
@@ -537,7 +545,7 @@ write_jsonl("data/train.jsonl", all_examples)
 1. `data/train.jsonl` is valid JSONL (every line parses as valid JSON)
 2. Every line has `instruction`, `input`, `output` keys
 3. Total examples between 10,000 and 25,000
-4. Token ratio is within ±3% of 60/25/15
+4. Token ratio is within ±3% of 50/25/15/10
 5. Language breakdown includes C, Python, JS, CSS, HTML
 6. No duplicate outputs across the entire file
 7. Sample 50 random examples and manually verify quality:
@@ -584,6 +592,61 @@ Step 6: Token counting → filter → balance → deduplicate
 Step 7: Shuffle + write data/train.jsonl + data/stats.json
     │
 Step 8: Validate structure, ratios, quality
+```
+
+## Resource-Aware Orchestrator
+
+The instruct phase (and every future LLM-heavy stage) runs through
+`orchestrator.py` — a barebones, reusable execution runtime. It owns three things:
+
+1. **Hardware probing** (`probe()`) — live CPU cores, RAM, disk, GPU (via
+   `nvidia-smi`), and the LM Studio llama.cpp backend path.
+2. **Resource planning** (`plan_llm_resources()`) — turns the probe into a worker
+   set: one batched GPU worker (LM Studio `libllama.so`, `n_parallel` sized to fit
+   free VRAM) plus as many CPU workers (llama-cpp-python, pure-CPU) as free cores
+   and RAM allow.
+3. **Distributed execution** (`run_llm_completions()`) — spawn-isolates each worker
+   (the LM Studio libllama and llama-cpp-python can never share one process), feeds
+   the job queue, collects results in input order, and logs per-run system stats.
+
+**Why spawn-isolated workers:** the GPU path loads LM Studio's bundled `libllama.so`
+(ctypes, `RTLD_GLOBAL`) and the CPU path loads llama-cpp-python, which bundles its
+*own* llama.cpp. They export the same symbols, so they cannot coexist in one process.
+Separate processes let both memory buses run at once.
+
+**CPU workers are zero-VRAM:** llama-cpp-python is usually built with CUDA, so left
+alone it allocates VRAM even at `n_gpu_layers=0`. Each CPU worker sets
+`CUDA_VISIBLE_DEVICES=""` in its own process, making it pure-CPU so it never OOMs the
+GPU worker.
+
+**Per-run logs:** every run writes to `data/logs/<run_id>/`:
+- `run.log` — worker plan, progress, `[sys]` samples every 10 s
+- `system_stats.csv` — 1 s CPU%/RAM/GPU-util/VRAM/power/temp samples
+- `worker_<name>.log` — per-worker logs
+- `plan.json` — worker specs, per-worker throughput, final stats
+
+**Auto-calibration:** with no flags, `_orchestrator_plan` runs `calibrate_plan()`,
+which races gpu-only / +1cpu / +2cpu on a 60-job sample of the *real* workload and
+keeps whichever wins on the machine. On this laptop (RTX 3050 4 GB, 1.5B Q4 model)
+the measured result was:
+
+| Mix | Throughput |
+|---|---|
+| gpu-only | 1.25 jobs/s |
+| gpu + 1 cpu worker | 1.08 jobs/s |
+| gpu + 2 cpu workers | 0.96 jobs/s |
+
+GPU-only wins here: the batched GPU worker is VRAM-bandwidth bound and the CPU
+workers steal CPU time it needs for scheduling while adding far less than they take.
+CPU workers are still supported and win for other job types (embeddings, larger
+models, no-GPU machines) — override the choice with `--cpu-workers N`.
+
+**CLI:**
+```bash
+uv run python orchestrator.py                          # print probe + plan
+uv run python data_prep.py --phase instruct            # calibrated plan
+uv run python data_prep.py --phase instruct --cpu-workers 2 --cpu-threads 2 --gpu-parallel 8
+uv run python data_prep.py --phase instruct --instruct-limit 100   # benchmark on real chunks
 ```
 
 ## Batched LLM Inference via LM Studio
@@ -634,11 +697,13 @@ The pipeline lives in the project root:
 ```
 ├── data_prep.py              # CLI entry point: orchestrates all phases (Steps 1–8)
 ├── llm_backend.py            # LM Studio batched LLM backend (ctypes bindings to libllama.so)
+├── orchestrator.py           # Resource-aware orchestrator: probe → plan → distributed run
 ├── run_data_prep.sh          # Bash runner — pre-flight checks, venv, model, invokes data_prep.py
 ├── tests/
 │   └── smoke_batched_llm.py  # Quick smoke test for the LM Studio backend
 ├── data/
-│   └── chunks/               # Checkpoint files (code_chunks_raw, _ready, doc_, alignment_)
+│   ├── logs/                 # Per-run orchestrator logs (run.log, system_stats.csv, plan.json)
+│   └── chunks/               # Checkpoint files (code_chunks_raw, _ready, doc_, alignment_, devops_)
 ├── models/                   # GGUF model files (qwen2.5-coder-1.5b-instruct-q4_k_m.gguf)
 ├── input_data/               # Cloned repos, scraped docs, alignment seeds
 └── docs/

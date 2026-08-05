@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-# run_data_prep.sh — Phase C Dataset Construction Runner (60/25/15 Rule)
+# run_data_prep.sh — Phase C Dataset Construction Runner (50/25/15/10 Rule)
 # =============================================================================
 #
 # Tiger Style applied to this script:
@@ -21,6 +21,9 @@
 #   ./run_data_prep.sh --verbose               # Full debug logging
 #   ./run_data_prep.sh --skip-model-download   # Skip automatic model download
 #   ./run_data_prep.sh --smoke-test            # Quick smoke test of batched LLM
+#   ./run_data_prep.sh --instruct-limit 100    # First N chunks only (benchmark)
+#   ./run_data_prep.sh --cpu-workers 2         # Force 2 CPU workers in orchestrator
+#   ./run_data_prep.sh --gpu-parallel 8        # Force GPU batch size in orchestrator
 # =============================================================================
 
 set -euo pipefail  # Tiger Style: fail fast, no silent errors, catch unset vars
@@ -60,7 +63,7 @@ pre_check() {
 
 echo ""
 echo -e "${BLUE}════════════════════════════════════════════════════════════${NC}"
-echo -e "${BLUE}  Phase C: Dataset Construction (60/25/15 Rule) Starting...${NC}"
+echo -e "${BLUE}  Phase C: Dataset Construction (50/25/15/10 Rule) Starting...${NC}"
 echo -e "${BLUE}════════════════════════════════════════════════════════════${NC}"
 echo ""
 
@@ -70,6 +73,10 @@ PHASE="all"
 VERBOSE=""
 SKIP_MODEL_DOWNLOAD=false
 SMOKE_TEST=false
+INSTRUCT_LIMIT=""
+CPU_WORKERS=""
+CPU_THREADS=""
+GPU_PARALLEL=""
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -85,6 +92,22 @@ while [[ $# -gt 0 ]]; do
             ;;
         --smoke-test)
             SMOKE_TEST=true
+            ;;
+        --instruct-limit)
+            shift
+            INSTRUCT_LIMIT="--instruct-limit $1"
+            ;;
+        --cpu-workers)
+            shift
+            CPU_WORKERS="--cpu-workers $1"
+            ;;
+        --cpu-threads)
+            shift
+            CPU_THREADS="--cpu-threads $1"
+            ;;
+        --gpu-parallel)
+            shift
+            GPU_PARALLEL="--gpu-parallel $1"
             ;;
         --help|-h)
             head -30 "$0" | grep "^#  " | sed 's/^#  //'
@@ -193,7 +216,8 @@ uv pip install \
     huggingface-hub \
     tqdm \
     transformers \
-    blake3
+    blake3 \
+    psutil
 log_ok "Dependencies installed."
 
 echo ""
@@ -250,7 +274,7 @@ log_info "Executing data_prep.py with phase: $PHASE"
 echo ""
 
 # Tiger Style: explicit timeout — 4 hours max for the full pipeline.
-uv run python data_prep.py --phase "$PHASE" $VERBOSE
+uv run python data_prep.py --phase "$PHASE" $VERBOSE $INSTRUCT_LIMIT $CPU_WORKERS $CPU_THREADS $GPU_PARALLEL
 
 EXIT_CODE=$?
 

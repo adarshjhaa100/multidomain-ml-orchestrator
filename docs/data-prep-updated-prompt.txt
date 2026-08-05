@@ -1,0 +1,12 @@
+Go over data preparation stage of updated research-prompt-coding-model-init.md
+Phase C: Dataset Construction (The 50/25/15/10 Rule)
+
+Scan the current code. Make sure to squeeze out last bit of performance out of both CPU and GPU rather than just CPU or just GPU. I have 64GB ram bro, use it as you like.
+
+Aim is to build a custom barebones "orchestrator" file for such jobs ( this can be used later stages as well ) Which when given input(s) automatically determines the availale resources ( both GPU and CPU and RAM), distributes the task amongst them making sure resources are full utilized till the LAST DROP (except OS overhead and interpreter overhead ). Right now, only GPU is being using.
+
+Keep continuously iterating this development process and testing with real system stats. Have a proper log for all this in a file unique for each run on local data/logs folder.
+
+Update data-prep-stage-instructions.md and other relevant script files to use the orchestrator for data generation phase, especially where LLM is loaded based on the same.
+
+Make sure to read the current code properly and ensure lm studio llaama.cpp if it exists is utilized
