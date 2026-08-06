@@ -1109,14 +1109,61 @@ def _generate_instructions_serial(
     return saved_count, generation_failures
 
 
+def _instruct_from_hf(
+    logger: logging.Logger,
+    output_path: Path,
+) -> Path:
+    """Alternate code-layer path: stream instruction→code pairs from HuggingFace.
+
+    Tiger Style:
+      - No repos are cloned and no GPU hours are spent — this is the fast path
+        for `--phase instruct --instruct-from-hf`.
+      - Same output contract as the GPU path (instruction/input/output/metadata),
+        so downstream phases are unchanged.
+    """
+    logger.info("=== Phase 3 (alternate): Instructions from HuggingFace (--instruct-from-hf) ===")
+    logger.info("  (no GitHub repos downloaded, no GPU generation)")
+
+    examples: List[Dict[str, Any]] = []
+    seen_hashes: set = set()
+    for source in HF_CODE_SOURCES:
+        exs = _fetch_hf_source(source, _hf_row_to_code_example, logger)
+        logger.info("  [hf:%s] fetched %d examples", source["name"], len(exs))
+        for ex in exs:
+            h = compute_blake3(ex["output"])
+            if h in seen_hashes:
+                continue
+            seen_hashes.add(h)
+            examples.append(ex)
+
+    logger.info("  Total downloaded code instruction examples: %d", len(examples))
+    assert len(examples) >= 50, (
+        f"Only {len(examples)} downloaded code examples — check network/HF sources."
+    )
+
+    random.shuffle(examples)
+    write_jsonl(output_path, examples)
+    logger.info("  Written: %s (%d code instruction examples)", output_path, len(examples))
+    return output_path
+
+
 def phase_generate_instructions(
     logger: logging.Logger,
     instruct_limit: Optional[int] = None,
     cpu_workers: Optional[int] = None,
     cpu_threads: Optional[int] = None,
     gpu_parallel: Optional[int] = None,
+    instruct_from_hf: bool = False,
 ) -> Path:
     """Phase 3: Generate synthetic instructions for every code chunk.
+
+    Two paths write `code_chunks_ready.jsonl`:
+
+      GPU path (default) — clones-derived chunks get synthetic instructions from
+      the local model (this is the ~11h run).
+
+      HF path (--instruct-from-hf) — streams ready-made instruction→code pairs
+      from HuggingFace instead.  No repos are downloaded, no GPU is used.
 
     Tiger Style:
       - Lazy-loads the LLM (no wasted resources if this phase is skipped).
@@ -1129,6 +1176,10 @@ def phase_generate_instructions(
     output_path = CHUNKS_DIR / "code_chunks_ready.jsonl"
     if _check_checkpoint(output_path, "generated instructions", min_records=50, logger=logger):
         return output_path
+
+    if instruct_from_hf:
+        return _instruct_from_hf(logger, output_path)
+
     logger.info("=== Phase 3: Generating synthetic instructions ===")
 
     input_path = CHUNKS_DIR / "code_chunks_raw.jsonl"
@@ -1374,6 +1425,83 @@ HF_DEVOPS_SOURCES: List[Dict[str, Any]] = [
 
 HF_CHAT_HUMAN = "human"
 HF_CHAT_GPT = "gpt"
+
+
+# ── Hugging Face alignment sources (alternate to GPU code expansion) ────────
+# Tiger Style: used when --align-from-hf is given instead of spend hours on the
+# local model.  High-quality instruction→code corpora streamed via datasets-server
+# and mapped to the canonical schema.  These are the same shape the GPU path
+# produces, so the filter/mix/validate phases consume them identically.
+HF_ALIGNMENT_SOURCES: List[Dict[str, Any]] = [
+    {
+        "name": "evol-codealpaca-v1",
+        "dataset": "theblackcat102/evol-codealpaca-v1",
+        "config": "default",
+        "split": "train",
+        "cap": 4000,
+        "license": "Apache-2.0",
+        "input_col": "input",
+        "output_col": "output",
+    },
+    {
+        "name": "code-instructions-122k",
+        "dataset": "TokenBender/code_instructions_122k_alpaca_style",
+        "config": "default",
+        "split": "train",
+        "cap": 4000,
+        "license": "MIT",
+        "input_col": "input",
+        "output_col": "output",
+    },
+]
+
+
+# ── Hugging Face code-layer sources (alternate to 11h GPU instruction gen) ──
+# Tiger Style: used when --instruct-from-hf is given.  Skips repo cloning + the
+# GPU instruction phase entirely and instead streams ready-made instruction→code
+# pairs into the canonical schema, so the whole job stays off the repos.
+HF_CODE_SOURCES: List[Dict[str, Any]] = [
+    {
+        "name": "self-oss-instruct-exec-filter-50k",
+        "dataset": "bigcode/self-oss-instruct-sc2-exec-filter-50k",
+        "config": "default",
+        "split": "train",
+        "cap": 20000,
+        "license": "Apache-2.0",
+        "input_col": "prompt",
+        "output_col": "response",
+    },
+    {
+        "name": "evol-codealpaca-v1",
+        "dataset": "theblackcat102/evol-codealpaca-v1",
+        "config": "default",
+        "split": "train",
+        "cap": 20000,
+        "license": "Apache-2.0",
+        "input_col": "input",
+        "output_col": "output",
+    },
+    {
+        "name": "python-code-instructions-18k",
+        "dataset": "iamtarun/python_code_instructions_18k_alpaca",
+        "config": "default",
+        "split": "train",
+        "cap": 18000,
+        "license": "Apache-2.0",
+        "input_col": "input",
+        "output_col": "output",
+    },
+    {
+        "name": "code-instructions-122k",
+        "dataset": "TokenBender/code_instructions_122k_alpaca_style",
+        "config": "default",
+        "split": "train",
+        "cap": 20000,
+        "license": "MIT",
+        "input_col": "input",
+        "output_col": "output",
+    },
+]
 
 
 def _scrape_with_cache(
@@ -1791,6 +1919,67 @@ def _hf_row_to_devops_example(
     return {
         "instruction": instruction,
         "input": "",
+        "output": output,
+        "metadata": metadata,
+    }
+
+
+def _hf_row_to_alignment_example(
+    source: Dict[str, Any],
+    row: Dict[str, Any],
+) -> Optional[Dict[str, Any]]:
+    """Map a raw HF instruction→code row into the alignment-layer schema.
+
+    Tiger Style: mirrors `_hf_row_to_doc_example` — validates required values,
+    returns None on unusable rows so the caller counts them as skipped.
+    """
+    instruction = str(row.get("instruction", "") or "").strip()
+    input_text = str(row.get(source["input_col"], "") or "").strip()
+    output = str(row.get(source["output_col"], "") or "").strip()
+
+    if not instruction or not output:
+        return None
+
+    return {
+        "instruction": instruction,
+        "input": input_text,
+        "output": output,
+        "metadata": {
+            "layer": "alignment",
+            "language": "unknown",
+            "source": f"hf:{source['name']}",
+            "license": source.get("license", ""),
+        },
+    }
+
+
+def _hf_row_to_code_example(
+    source: Dict[str, Any],
+    row: Dict[str, Any],
+) -> Optional[Dict[str, Any]]:
+    """Map a raw HF instruction→code row into the code-layer schema.
+
+    Tiger Style: same validation contract as the other HF mappers — fields are
+    required non-empty, unusable rows return None for the caller to skip.
+    """
+    instruction = str(row.get("instruction", "") or "").strip()
+    output = str(row.get(source["output_col"], "") or "").strip()
+    if not instruction or not output:
+        return None
+
+    metadata: Dict[str, Any] = {
+        "layer": "code",
+        "language": "unknown",
+        "source": f"hf:{source['name']}",
+        "license": source.get("license", ""),
+    }
+    lang_col = source.get("language_col")
+    if lang_col and row.get(lang_col):
+        metadata["language"] = str(row.get(lang_col))
+
+    return {
+        "instruction": instruction,
+        "input": str(row.get(source.get("input_col", "input"), "") or "").strip(),
         "output": output,
         "metadata": metadata,
     }
@@ -2723,26 +2912,70 @@ def _avg_code_tokens(records: List[Dict[str, Any]]) -> int:
     return total // len(records)
 
 
+def _expand_alignment_from_hf(
+    logger: logging.Logger,
+    output_path: Path,
+) -> Path:
+    """Alternate alignment path: stream ready-made examples from HuggingFace.
+
+    Tiger Style:
+      - Same output contract as the GPU path (instruction/input/output/metadata),
+        so downstream phases are unchanged.
+      - Bounded by each source's cap; never fetches unbounded data.
+    """
+    logger.info("=== Phase 5c: Alignment from HuggingFace (--align-from-hf, no GPU) ===")
+
+    examples: List[Dict[str, Any]] = []
+    seen_hashes: set = set()
+    for source in HF_ALIGNMENT_SOURCES:
+        exs = _fetch_hf_source(source, _hf_row_to_alignment_example, logger)
+        logger.info("  [hf:%s] fetched %d examples", source["name"], len(exs))
+        for ex in exs:
+            h = compute_blake3(ex["output"])
+            if h in seen_hashes:
+                continue
+            seen_hashes.add(h)
+            examples.append(ex)
+
+    logger.info("  Total downloaded alignment examples: %d", len(examples))
+    assert len(examples) >= 100, (
+        f"Only {len(examples)} downloaded alignment examples — check network/HF sources."
+    )
+
+    random.shuffle(examples)
+    write_jsonl(output_path, examples)
+    logger.info("  Written: %s (%d alignment examples)", output_path, len(examples))
+    return output_path
+
+
 def phase_expand_alignment_from_code(
     logger: logging.Logger,
     limit: Optional[int] = None,
     target_pct: float = 0.15,
     gpu_parallel: Optional[int] = None,
+    align_from_hf: bool = False,
 ) -> Path:
-    """Phase 5c: Bump the alignment layer from real code chunks, PURE GPU.
+    """Phase 5c: Bump the alignment layer to the desired count.
 
-    Each code chunk becomes one alignment example: the instruction asks for a
-    Tiger-Style-compliant refactor, the input is the original code verbatim, and
-    the output is <thought> + the model's refactor.  The local model runs through
-    the orchestrator fleet with CPU workers forced to 0 (GPU-only) because only
-    the refactor (not the input) needs a generation pass.
+    Two paths write `alignment_code_chunks.jsonl` (merged into the alignment
+    layer by the filter phase):
 
-    Writes `alignment_code_chunks.jsonl`, which the filter phase merges into the
-    alignment layer (same pattern as doc_hf/devops_hf).
+      GPU path (default) — each code chunk becomes one alignment example: the
+      instruction asks for a Tiger-Style-compliant refactor, the input is the
+      original code verbatim, and the output is <thought> + the model's refactor.
+      Runs through the orchestrator fleet with CPU workers forced to 0.
+
+      HF path (--align-from-hf) — streams ready-made instruction→code examples
+      from HuggingFace (CodeAlpaca-20k) instead of spending hours generating.
+      No model, no GPU, no waiting.
     """
     output_path = CHUNKS_DIR / "alignment_code_chunks.jsonl"
     if _check_checkpoint(output_path, "code-derived alignment examples", min_records=100, logger=logger):
         return output_path
+
+    if align_from_hf:
+        return _expand_alignment_from_hf(logger, output_path)
+
     logger.info("=== Phase 5c: Expanding alignment examples from code (pure GPU) ===")
 
     input_path = CHUNKS_DIR / "code_chunks_ready.jsonl"
@@ -3916,6 +4149,13 @@ def _parse_args() -> argparse.Namespace:
              "(useful for benchmarking the orchestrator on real data).",
     )
     parser.add_argument(
+        "--instruct-from-hf",
+        action="store_true",
+        help="in instruct: download ready-made instruction→code pairs from "
+             "HuggingFace instead of generating with the local GPU model. "
+             "Skips GitHub repo cloning entirely.",
+    )
+    parser.add_argument(
         "--align-limit",
         type=int,
         default=None,
@@ -3928,6 +4168,12 @@ def _parse_args() -> argparse.Namespace:
         default=0.15,
         help="Target token share for the alignment layer when auto-scaling "
              "the align-code phase (default: 0.15 = 15%%).",
+    )
+    parser.add_argument(
+        "--align-from-hf",
+        action="store_true",
+        help="in align-code, download ready-made alignment examples from "
+             "HuggingFace instead of generating with the local GPU model.",
     )
     parser.add_argument(
         "--cpu-workers",
@@ -3999,6 +4245,7 @@ def main() -> int:
                 cpu_workers=args.cpu_workers,
                 cpu_threads=args.cpu_threads,
                 gpu_parallel=args.gpu_parallel,
+                instruct_from_hf=args.instruct_from_hf,
             )
 
         elif phase_name == "docs":
@@ -4016,6 +4263,7 @@ def main() -> int:
                 limit=args.align_limit,
                 target_pct=args.align_target,
                 gpu_parallel=args.gpu_parallel,
+                align_from_hf=args.align_from_hf,
             )
 
         elif phase_name == "devops":
