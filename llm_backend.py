@@ -582,9 +582,31 @@ class BatchedLlama:
         seqs = []
         for i, req in enumerate(requests):
             prompt = req["prompt"]
-            tokens = self._tokenize(prompt)
             # Leave headroom for the generated tokens inside the shared context.
             budget = self.ctx_per_seq - int(req.get("max_tokens", 128)) - 16
+            # Pre-truncate the raw string so tokenizing it can never overflow the
+            # fixed _tokenize buffer (16384).  ~6 chars/token is a safe ceiling
+            # for code, so an oversized prompt is cut before llama_tokenize sees
+            # it, rather than raising and crashing the whole worker process.
+            budget_chars = budget * 6
+            if len(prompt) > budget_chars:
+                prompt = prompt[:budget_chars]
+            try:
+                tokens = self._tokenize(prompt)
+            except Exception:
+                seqs.append({
+                    "id": i,
+                    "prompt": [],
+                    "out": [],
+                    "max": int(req.get("max_tokens", 128)),
+                    "temp": float(req.get("temperature", 0.7)),
+                    "top_p": float(req.get("top_p", 0.95)),
+                    "stop": [s.encode() for s in req.get("stop", []) if s],
+                    "text": b"",
+                    "active": False,
+                    "failed": True,
+                })
+                continue
             if len(tokens) > budget:
                 tokens = tokens[:budget]
             seqs.append({

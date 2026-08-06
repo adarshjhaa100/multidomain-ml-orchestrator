@@ -866,6 +866,11 @@ def run_llm_completions(
             except Exception:
                 continue
             idx = rec.get("_idx")
+            # A "lost" row is a gap-fill placeholder from an interrupted run
+            # (see below), not a real result — it means the index still needs
+            # to be generated, so skip it on resume.
+            if rec.get("_worker") == "lost":
+                continue
             if idx is not None and 0 <= idx < total and idx not in results:
                 results[idx] = rec
 
