@@ -631,10 +631,23 @@ Build:
 - artifact list.
 
 Outcome:
-
 - user receives answer,
 - user receives evidence,
 - user receives failure reason if system stops.
+
+---
+
+## Step 11: Evaluation, Running on Low spec device and Further modification if required
+
+- Evaluate the whole system against some self-curated test prompts
+- Params: Energy ( Resource, Battery etc. ), Time, QPS, Effectiveness/Accuracy etc.
+- Test on macbook and if possible, my phone
+- Make changes if required
+
+Outcome:
+- Tested system
+- Discover Pain points and frictions while executing
+- Final feasability against similar models with no boundations (speed + accuracy + efficiency/energy)
 
 ---
 
