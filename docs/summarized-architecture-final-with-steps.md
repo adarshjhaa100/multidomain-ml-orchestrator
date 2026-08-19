@@ -3,6 +3,8 @@
 
 The system is a Linux-based Harness(execution wrapper that validates and retries model output) controlled by an Orchestrator(deterministic controller, not an always-loaded LLM). It hot-swaps small local models, uses tiered RAG(retrieval-augmented generation) for grounded knowledge, plans work as a DAG(directed acyclic graph of tasks), executes code in a lightweight Sandbox(isolated execution environment), and stores all state on disk.
 
+NOTE: Make the solution scalable.
+
 Evidence for divide and conquer approach:
 
 - Divide-and-Conquer Is What LLM-Based Multi-Agent System Need: https://arxiv.org/html/2506.15451v1
@@ -10,7 +12,7 @@ Evidence for divide and conquer approach:
 
 ---
 
-## Locked System Constraints
+## Locked System Constraints ( Might scale up )
 
 | Constraint | Decision |
 |---|---|
@@ -83,7 +85,7 @@ The Orchestrator owns the loop. Models are temporary tools.
 
 RAG is now a first-class layer.
 
-### RAG Components
+### RAG Components ( Might Scale Up )
 
 | Component | Specific Choice | Purpose |
 |---|---|---|
