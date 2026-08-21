@@ -42,8 +42,8 @@ Responsibilities:
 
 - receive query,
 - normalize query,
-- apply safety policy,
-- apply resource policy,
+- apply safety policy, ( workspace constraints, isolation level, human approval flags, harm prevention, PII Data redaction, Domain Boundary enforcement )
+- apply resource policy, ( Compute budget, latency costs etc. based on which, the speed and processing will be QUOTA'd )
 - decide if query is research, coding, or mixed.
 
 Outputs:
@@ -51,6 +51,7 @@ Outputs:
 - accepted query,
 - policy flags,
 - resource profile.
+- Query classification
 
 ---
 
@@ -58,17 +59,18 @@ Outputs:
 
 Specific tools:
 
-- Python controller,
+- Python controller (Some low level language like RUST, Zig, C atleast),
 - SQLite state store,
 - psutil(resource monitor),
 - event logger.
 
 Responsibilities:
 
-- manage query lifecycle,
-- monitor CPU/RAM,
+- QUERY DAG LOOP ( Runs and Manages ligecycle DAGs of executions(Threads, processes etc. )  as and when required to utmost utilize resources based on constraints )
+- manage query lifecycle ( okay all the steps it needs to take ),
+- monitor CPU/RAM ( and then make decisions ased on this ),
 - load and unload models,
-- validate plans,
+- validate plans ( how? maybe through some model, mathematically, good sources etc. ),
 - schedule nodes,
 - manage retries,
 - store artifacts,
@@ -77,7 +79,7 @@ Responsibilities:
 
 Rule:
 
-The Orchestrator owns the loop. Models are temporary tools.
+The Orchestrator owns the QUERY DAG LOOP. Models are temporary tools.
 
 ---
 
