@@ -647,6 +647,7 @@ Outcome:
 - Params: Energy ( Resource, Battery etc. ), Time, QPS, Effectiveness/Accuracy etc.
 - Test on macbook and if possible, my phone
 - Make changes if required
+- Hallucination Detection and Self-Improvement, Human Feedback RL ( "Store" hallucinations )
 
 Outcome:
 - Tested system
