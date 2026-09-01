@@ -3,7 +3,8 @@ Across development of this project, we're to test fuzzily, benchmark and profile
 # STAGE 1 - MULTIDOMAIN ORCHESTRATOR SKELETON
 
 ## Step 0:
-  Prepare data
+- (DONE) Prepare data for evaluation
+- Automate evaluation of system based on evaluation data
 
 ## Step 1: Build Base Skeleton
 
